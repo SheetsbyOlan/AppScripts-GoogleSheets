@@ -1,0 +1,202 @@
+function onOpen() {
+  var ui = SpreadsheetApp.getUi();
+  ui.createMenu('Automations')// Change 'Automations' to the name you want for the menu bar
+      .addItem('Add Recurring', 'copyRecurringTasks')// 'Add Recurring' is the name in the menu bar dropdown. 'copyRecurringTasks' is the name of the function below.
+      .addToUi();
+}
+
+function onEdit(e) {
+  addatimestamp(e);
+  movedone(e)
+}
+
+function addatimestamp(e) {
+  var sheet = e.source.getActiveSheet();
+  
+  if (sheet.getName() !== "Task List") {
+    return;
+  }
+  
+  var range = e.range;
+  var column = range.getColumn();
+  Logger.log('edited');
+  
+  if (column == 3) {
+    var timestamp = new Date();
+    var row = range.getRow();
+    var value = e.value;
+    Logger.log("edited cell: " + range.getA1Notation());
+    
+    if (value == "Done") {
+      sheet.getRange(row, 12).setValue(timestamp);
+    }
+    if (value == "Pending") {
+      sheet.getRange(row, 11).setValue(timestamp);
+    }
+  }
+  
+  if (column == 2) {
+    var timestamp = new Date();
+    var row = range.getRow();
+    var value = e.value;
+    Logger.log("edited cell: " + range.getA1Notation());
+    
+    if (value !== "") {
+      sheet.getRange(row, 10).setValue(timestamp);
+    }
+  }
+}
+
+
+
+function movedone(e) {
+  var sheet = e.source.getActiveSheet();
+  var range = e.range;
+  var row = range.getRow();
+  var col = range.getColumn();
+  
+  if (range.getColumn() == 3 && e.value == "Done") {
+      var targetSheet = e.source.getSheetByName("Done"); 
+      var targetRange = targetSheet.getRange(targetSheet.getLastRow() + 1, 1); 
+    
+      sheet.getRange(range.getRow(), 1, 1, sheet.getLastColumn()).copyTo(targetRange);
+    
+      sheet.deleteRow(range.getRow());
+      }
+
+    if (range.getColumn() == 3 && e.value == "Parked"){
+      var targetSheet = e.source.getSheetByName("Parked Tasks"); 
+      var targetRange = targetSheet.getRange(targetSheet.getLastRow() + 1, 1); 
+    
+      sheet.getRange(range.getRow(), 1, 1, sheet.getLastColumn()).copyTo(targetRange);
+    
+      sheet.deleteRow(range.getRow());
+      }
+    if (range.getColumn() == 3 && e.value == "Ready"){
+      var targetSheet = e.source.getSheetByName("Task List"); 
+      var targetRange = targetSheet.getRange(targetSheet.getLastRow() + 1, 1); 
+    
+      sheet.getRange(range.getRow(), 1, 1, sheet.getLastColumn()).copyTo(targetRange);
+    
+      sheet.deleteRow(range.getRow());
+      }
+}
+
+function updateTriggers() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("Recurring"); 
+  
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert("Error: Could not find a sheet named 'Recurring'.");
+    return;
+  }
+
+  var userTimeZone = Session.getScriptTimeZone();
+  ss.setSpreadsheetTimeZone(userTimeZone);
+  
+  var data = sheet.getRange("R2:T8").getValues(); 
+  
+  var hasError = false;
+  var anyChecked = false;
+
+  // Pre-process the data to handle "2 AM" or "2"
+  var processedData = data.map(function(row) {
+    var isEnabled = row[0];
+    var dayStr    = row[1];
+    var rawHour   = row[2];
+    var hourValue = null;
+
+    if (isEnabled === true) {
+      anyChecked = true;
+      
+      // Check if it's a Date object (e.g., user typed "2 AM")
+      if (rawHour instanceof Date) {
+        hourValue = rawHour.getHours();
+      } 
+      // Check if it's a number (e.g., user typed "2")
+      else if (!isNaN(rawHour) && rawHour !== "") {
+        hourValue = parseInt(rawHour);
+      }
+
+      // Validate the range
+      if (hourValue === null || hourValue < 0 || hourValue > 23) {
+        hasError = true;
+      }
+    }
+    return { enabled: isEnabled, day: dayStr, hour: hourValue };
+  });
+
+  if (!anyChecked || hasError) {
+    SpreadsheetApp.getUi().alert(
+      "Please ensure all days that you wish to add recurring tasks automatically for have a checkbox. " +
+      "Also add the hour (0-23) you want to run the task. " +
+      "I personally add my recurring tasks Mon-Friday at 2 (2 AM) so they're waiting for me when I login. " +
+      "It will default to your local time."
+    );
+    return;
+  }
+
+  // CLEANUP
+  var allTriggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < allTriggers.length; i++) {
+    if (allTriggers[i].getHandlerFunction() === "copyRecurringTasks") {
+      ScriptApp.deleteTrigger(allTriggers[i]);
+    }
+  }
+  
+  var createdCount = 0;
+
+  // CREATE TRIGGERS
+  processedData.forEach(function(item) {
+    if (item.enabled === true) {
+      var dayEnum = ScriptApp.WeekDay[item.day.toString().toUpperCase()];
+      
+      if (dayEnum) {
+        ScriptApp.newTrigger("copyRecurringTasks")
+          .timeBased()
+          .onWeekDay(dayEnum)
+          .atHour(item.hour) // Now passing a clean integer 0-23
+          .inTimezone(userTimeZone)
+          .create();
+        createdCount++;
+      }
+    }
+  });
+  
+  SpreadsheetApp.getUi().alert("Success! Automated schedule updated.\n\nTimezone: " + userTimeZone + "\nActive Days: " + createdCount);
+}
+function copyRecurringTasks() {
+  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  var recurringSheet = spreadsheet.getSheetByName("Recurring");
+  var taskListSheet = spreadsheet.getSheetByName("Task List");
+  var lastRow = recurringSheet.getLastRow();
+  
+  // Track how many tasks were added
+  var tasksAddedCount = 0;
+  
+  for (var i = 2; i <= lastRow; i++) { 
+    var dayValue = recurringSheet.getRange(i, 11).getValue(); 
+    if (dayValue === "Yes") {
+      var taskData = recurringSheet.getRange(i, 2, 1, 7).getValues();
+      var nextRow = taskListSheet.getLastRow() + 1;
+      taskListSheet.getRange(nextRow, 1, 1, 7).setValues(taskData);
+      
+      var now = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss");
+      taskListSheet.getRange(nextRow, 10).setValue(now); 
+      recurringSheet.getRange(i, 9).setValue(now); 
+      
+      tasksAddedCount++; // Increment the counter
+    }
+  }
+
+  // If no tasks were marked "Yes"
+  if (tasksAddedCount === 0) {
+    try {
+      var ui = SpreadsheetApp.getUi();
+      ui.alert("No additional recurring tasks need to be completed today");
+    } catch (e) {
+      // If there is no UI (background trigger), just log it and do nothing
+      Logger.log("No tasks found. Background trigger completed without popup.");
+    }
+  }
+}
