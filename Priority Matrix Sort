@@ -1,0 +1,50 @@
+function onEdit(e) {
+  const range = e.range;
+  const sheet = range.getSheet();
+  
+  // 1. Only run if we are on the "Task List" tab
+  // Change "Task List" to the exact name of your tab
+  if (sheet.getName() !== "Task List") return;
+
+  const editedRow = range.getRow();
+  const editedCol = range.getColumn();
+
+  // 2. Only trigger if the edit was in Column E (5) and Row 4 or below
+  if (editedCol === 5 && editedRow >= 4) {
+    
+    // Optional: Add a small delay so the sort doesn't feel "jerky" 
+    // while you are typing a date
+    Utilities.sleep(500); 
+    
+    // Call your existing sort function
+    sortByDeadlineThenPriority();
+  }
+}
+function sortByDeadlineThenPriority() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  
+  // Settings based on template specific "Task List" tab
+  const firstDataRow = 4; 
+  const priorityCol = 4; // Column D
+  const deadlineCol = 5; // Column E
+  
+  const lastRow = sheet.getLastRow();
+  const numRows = lastRow - (firstDataRow - 1);
+  const numCols = sheet.getLastColumn();
+
+  if (numRows <= 0) return;
+
+  const range = sheet.getRange(firstDataRow, 1, numRows, numCols);
+
+  /**
+   * THE LOGIC:
+   * 1. Sort by Deadline (Col 5) first.
+   * 2. If Deadlines are the same, sort by Priority (Col 4).
+   */
+  range.sort([
+    {column: deadlineCol, ascending: true}, // Earliest Dates first
+    {column: priorityCol, ascending: true}  // Then 1 - Recurring, 2 - Top, etc.
+  ]);
+
+  SpreadsheetApp.getActiveSpreadsheet().toast("Sorted: Deadline > Priority", "Priority Matrix");
+}
