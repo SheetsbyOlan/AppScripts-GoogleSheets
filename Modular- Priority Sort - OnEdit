@@ -1,0 +1,17 @@
+function onEdit(e) {
+  if (!e) return;
+
+  // 1. Always run timestamp/move logic (these check their own columns internally)
+  addatimestamp(e);
+  movedone(e);
+
+  // 2. ONLY trigger the sort if Column E (5) was the specific column edited
+  var col = e.range.getColumn();
+  var sheetName = e.range.getSheet().getName();
+  
+  if (sheetName === "Task List" && col === 5) {
+    // Tiny delay so the UI registers the date entry before the sort moves the row
+    Utilities.sleep(500); 
+    sortByDeadlineThenPriority();
+  }
+}
