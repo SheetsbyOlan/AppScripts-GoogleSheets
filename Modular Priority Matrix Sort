@@ -1,25 +1,3 @@
-function onEdit(e) {
-  const range = e.range;
-  const sheet = range.getSheet();
-  
-  // 1. Only run if we are on the "Task List" tab
-  // Change "Task List" to the exact name of your tab
-  if (sheet.getName() !== "Task List") return;
-
-  const editedRow = range.getRow();
-  const editedCol = range.getColumn();
-
-  // 2. Only trigger if the edit was in Column E (5) and Row 4 or below
-  if (editedCol === 5 && editedRow >= 4) {
-    
-    // Optional: Add a small delay so the sort doesn't feel "jerky" 
-    // while you are typing a date
-    Utilities.sleep(500); 
-    
-    // Call your existing sort function
-    sortByDeadlineThenPriority();
-  }
-}
 function sortByDeadlineThenPriority() {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
   
