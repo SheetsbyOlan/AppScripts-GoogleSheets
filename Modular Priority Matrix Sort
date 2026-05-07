@@ -2,7 +2,7 @@ function sortByDeadlineThenPriority() {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
   
   // Settings based on template specific "Task List" tab
-  const firstDataRow = 4; 
+  const firstDataRow = 3; 
   const priorityCol = 4; // Column D
   const deadlineCol = 5; // Column E
   
