@@ -393,6 +393,7 @@ function normalizeHeader(text) {
 // Builds header text -> column number for one sheet's header row.
 function getColumnMap(sheet, headerRow) {
   var lastCol = sheet.getLastColumn();
+  if (lastCol === 0) return {}; // totally blank tab, no headers to map yet
   var headers = sheet.getRange(headerRow, 1, 1, lastCol).getValues()[0];
   var map = {};
   headers.forEach(function(name, i) {
