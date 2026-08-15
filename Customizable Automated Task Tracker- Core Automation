@@ -1,0 +1,1260 @@
+/** ====================== CONFIGURATION ======================
+ *  Change these if you rename a tab or a column header.
+ */
+
+// Sheet names
+const TASK_LIST_SHEET = "Task List";
+const DONE_SHEET = "Done";
+const PARKED_SHEET = "Parked";
+const RECURRING_SHEET = "Recurring";
+const TASK_BUNDLES_SHEET = "Task Bundles";
+
+// Parked and Done always mirror Task List's columns (same headers, same order).
+// Add a tab name here if you want another tab to auto-sync the same way.
+const MIRROR_SHEETS = [PARKED_SHEET, DONE_SHEET];
+
+// Task List's headers are on row 2. Every other tab uses row 1.
+const TASK_LIST_HEADER_ROW = 2;
+const OTHER_SHEETS_HEADER_ROW = 1; // Parked, Done, Recurring
+
+function headerRowFor(sheetName) {
+  return sheetName === TASK_LIST_SHEET ? TASK_LIST_HEADER_ROW : OTHER_SHEETS_HEADER_ROW;
+}
+
+// Progress/status values
+const STATUS_DONE = "Done";
+const STATUS_PARKED = "Parked";
+const STATUS_READY = "Ready";
+const STATUS_PENDING = "Pending";
+
+// Tabs where changing "Progress" is allowed to timestamp/move a row.
+// Add a tab name here to let it do the same thing (like marking Done from Parked).
+const ACTIONABLE_SHEETS = [TASK_LIST_SHEET, PARKED_SHEET];
+
+// Where each Progress value sends the row. Case and extra spaces don't matter here -
+// "done" or "Done " in the cell both match, same as header matching everywhere else.
+const STATUS_ROUTES = {};
+STATUS_ROUTES[normalizeHeader(STATUS_DONE)] = DONE_SHEET;
+STATUS_ROUTES[normalizeHeader(STATUS_PARKED)] = PARKED_SHEET;
+STATUS_ROUTES[normalizeHeader(STATUS_READY)] = TASK_LIST_SHEET;
+
+function getStatusRoute(value) {
+  return STATUS_ROUTES[normalizeHeader(value)];
+}
+
+// Task List's headers - these need to match your actual row 2 text exactly
+const COL_TASK_NAME = "Task List";
+const COL_PROGRESS = "Progress";
+const COL_TASK_ADDED = "Task Added";
+const COL_TASK_STARTED = "Task Started";
+const COL_TASK_COMPLETED = "Task Completed";
+const COL_PRIORITY = "Priority";
+const COL_DEADLINE = "Deadline"; // Task List's real, script-computed date
+const COL_LINK = "Website"; // gets special handling so Smart Chips survive being copied - rename it here if you rename the header
+
+// Backup sort order, only used if the Priority Options list on Recurring can't be found.
+// Don't edit this to change your sort order - edit the Priority Options list instead.
+const PRIORITY_ORDER = ["Recurring", "Top", "High", "Medium", "Low", "Follow up", "Unable to Start"];
+
+// The master lists your Progress/Priority dropdowns pull from everywhere (Task List, Parked,
+// Done). Edit the list here once instead of updating three tabs. Named "Options" so they don't
+// collide with the Progress/Priority columns that already exist on this same sheet.
+const COL_PRIORITY_OPTIONS = "Priority Options";
+const COL_PROGRESS_OPTIONS = "Progress Options";
+
+// Recurring sheet - frequency rule columns
+const COL_REC_POSITION = "Position";       // First/Second/Third/Fourth/Last
+const COL_REC_DAY = "Day";                 // Monday-Sunday
+const COL_REC_PERIOD = "Period";           // Day/Week/Month/Quarter/Year
+const COL_REC_LAST_ADDED = "Last Added";   // history: when this rule last actually fired
+const COL_REC_NEXT_ADD = "Next Add";       // live-computed: next date this rule is due
+const COL_DAYS_TO_COMPLETE = "Days to Complete"; // Recurring-only; becomes Task List's Deadline when it fires
+
+// The 7-day trigger table, right below Recurring's header row. Controls which days a Daily
+// task actually gets added on.
+const COL_TRIGGER_ENABLED = "Add Trigger";
+const COL_TRIGGER_DAY = "Day of Week";
+const COL_TRIGGER_HOUR = "Time";
+const TRIGGER_TABLE_ROWS = 7;
+
+// Task Bundles - one-click groups of tasks (like "New Hire") added on demand from the Task
+// Bundles menu, not on a schedule. Project assigns each row to a bundle; Project Options is the
+// live list of bundle names, same idea as Priority Options above. MAX_TASK_BUNDLE_SLOTS caps how
+// many bundles can get their own menu item - Google Sheets menus can't be built fully dynamically,
+// so this is a hard limit. Need more than 15? Raise this number and add matching
+// runTaskBundleSlot functions further down.
+const COL_BUNDLE_PROJECT = "Project";
+const COL_BUNDLE_PROJECT_OPTIONS = "Project Options";
+const MAX_TASK_BUNDLE_SLOTS = 15;
+
+// Canonical (always English) period identifiers - used internally throughout the code.
+const PERIOD_DAY = "Day";
+const PERIOD_WEEK = "Week";
+const PERIOD_MONTH = "Month";
+const PERIOD_QUARTER = "Quarter";
+const PERIOD_YEAR = "Year";
+
+/** ====================== DROPDOWN VOCABULARY ======================
+ *  Position/Day/Period values are matched here. Case and spacing don't matter -
+ *  "monday", " Monday ", and "MONDAY" all work the same.
+ */
+
+const DAY_NAME_TO_INDEX = {
+  "sunday": 0, "monday": 1, "tuesday": 2, "wednesday": 3, "thursday": 4, "friday": 5, "saturday": 6
+};
+
+const POSITION_NUMBERS = { "first": 1, "second": 2, "third": 3, "fourth": 4 };
+const LAST_POSITION_NAMES = ["last"];
+
+const PERIOD_ALIASES = {
+  "day": PERIOD_DAY, "week": PERIOD_WEEK, "month": PERIOD_MONTH, "quarter": PERIOD_QUARTER, "year": PERIOD_YEAR
+};
+
+function canonicalPeriod(period) {
+  return PERIOD_ALIASES[normalizeHeader(period)] || null;
+}
+
+// One global cell, not per-row - nothing fires for any rule until this date passes.
+// Use it to delay a brand-new setup, or to pause everything while you're out.
+const RESUME_DATE_CELL = "N2";
+
+const TIMEZONE_PROPERTY_KEY = "USER_TIMEZONE";
+
+/** ====================== MENU ====================== */
+
+function onOpen() {
+  var ui = SpreadsheetApp.getUi();
+  ui.createMenu('Automations') // Change 'Automations' to the name you want for the menu bar
+      .addItem('Add Recurring', 'copyRecurringTasks')
+      .addItem('Sort by Deadline & Priority', 'sortTaskListByDeadlineThenPriority')
+      .addItem('Sync Columns Across Tabs', 'syncColumnHeaders')
+      .addToUi();
+  buildTaskBundlesMenu();
+}
+
+/** ====================== EDIT HANDLING ====================== */
+
+// True if this edit looks like part of a multi-row drag or paste, not a normal single edit.
+// Google Sheets fires a separate edit event per row during a drag, so this catches that by
+// checking whether another Progress edit just happened a few seconds ago. The sweep further
+// down is only worth its wider risk (touching rows beyond the one edited) when this is true.
+function isPartOfProgressEditBurst(numRows) {
+  if (numRows > 1) return true; // a real multi-row paste, all in this one event
+  var cache = CacheService.getDocumentCache();
+  var key = "RECENT_PROGRESS_EDIT";
+  var isBurst = cache.get(key) !== null;
+  cache.put(key, "1", 10); // 10-second window - covers a drag's separate per-row events
+  return isBurst;
+}
+
+function onEdit(e) {
+  if (!e || !e.range) return;
+
+  var sheet = e.range.getSheet();
+  var sheetName = sheet.getName();
+  var headerRow = headerRowFor(sheetName);
+
+  // Push a new or renamed header on Task List out to Parked and Done automatically.
+  var editedStartRow = e.range.getRow();
+  var editedEndRow = editedStartRow + e.range.getNumRows() - 1;
+  var touchesHeaderRow = TASK_LIST_HEADER_ROW >= editedStartRow && TASK_LIST_HEADER_ROW <= editedEndRow;
+  if (sheetName === TASK_LIST_SHEET && touchesHeaderRow) {
+    syncColumnHeaders();
+  }
+
+  // Recalculate Next Add the second a recurrence rule changes, so a bad combination shows up
+  // right away instead of days later when nothing fires.
+  if (sheetName === RECURRING_SHEET) {
+    updateNextAddForEditedRows(sheet, e.range);
+  }
+
+  if (ACTIONABLE_SHEETS.indexOf(sheetName) === -1) return;
+
+  var cols = getColumnMap(sheet, headerRow);
+  var taskNameCol = getCol(cols, COL_TASK_NAME);
+  var progressCol = getCol(cols, COL_PROGRESS);
+  var deadlineCol = getCol(cols, COL_DEADLINE);
+  if (!taskNameCol || !progressCol) {
+    // A toast, not a popup - this check runs on every edit, and a popup on every keystroke
+    // while a header's broken would lock up the whole sheet.
+    SpreadsheetApp.getActiveSpreadsheet().toast(
+      "Couldn't find \"" + COL_TASK_NAME + "\" or \"" + COL_PROGRESS + "\" on \"" + sheetName +
+      "\" row " + headerRow + " - automation is paused on this tab until that header's fixed.",
+      "⚠ Missing column", 6
+    );
+    return;
+  }
+
+  var editedStartCol = e.range.getColumn();
+  var editedEndCol = editedStartCol + e.range.getNumColumns() - 1;
+  var touchesTaskName = taskNameCol >= editedStartCol && taskNameCol <= editedEndCol;
+  var touchesProgress = progressCol >= editedStartCol && progressCol <= editedEndCol;
+  var touchesDeadline = !!deadlineCol && deadlineCol >= editedStartCol && deadlineCol <= editedEndCol;
+  if (!touchesTaskName && !touchesProgress && !touchesDeadline) return;
+
+  // Collect every row that got edited, whether it's one cell or a whole pasted block.
+  var startRow = e.range.getRow();
+  var numRows = e.range.getNumRows();
+  var rows = [];
+  for (var i = 0; i < numRows; i++) {
+    var r = startRow + i;
+    if (r > headerRow) rows.push(r); // never touch the header row
+  }
+
+  // Work bottom to top. Moving a row deletes it and shifts everything below up by one, so
+  // starting from the highest row number means a deletion never messes up a row we haven't
+  // gotten to yet.
+  rows.sort(function(a, b) { return b - a; });
+
+  rows.forEach(function(row) {
+    if (touchesTaskName) {
+      var nameValue = sheet.getRange(row, taskNameCol).getValue();
+      if (nameValue !== "") {
+        sheet.getRange(row, getCol(cols, COL_TASK_ADDED)).setValue(new Date());
+      }
+    }
+    if (touchesProgress) {
+      var progressValue = sheet.getRange(row, progressCol).getValue();
+      handleProgressChange(sheet, row, progressValue, cols);
+    }
+  });
+
+  // Backup pass for multi-row drags: dragging Done/Parked/Ready across several rows fires a
+  // separate edit per row, and by the time a later row's edit runs, an earlier row's move has
+  // already shifted everything below it - so that later edit can end up pointing at the wrong
+  // row and gets safely ignored. This re-checks the whole column fresh and finishes moving
+  // anything that got missed. Only runs during a multi-row burst - a normal single edit skips it.
+  if (touchesProgress && isPartOfProgressEditBurst(numRows)) {
+    var sweepLastRow = sheet.getLastRow();
+    var sweepNumRows = sweepLastRow - headerRow;
+    if (sweepNumRows > 0) {
+      var sweepValues = sheet.getRange(headerRow + 1, progressCol, sweepNumRows, 1).getValues();
+      for (var s = sweepValues.length - 1; s >= 0; s--) { // bottom-up, same reasoning as above
+        var sweepValue = sweepValues[s][0];
+        if (sweepValue && getStatusRoute(sweepValue)) {
+          handleProgressChange(sheet, headerRow + 1 + s, sweepValue, cols);
+        }
+      }
+    }
+  }
+
+  // Re-sort once per edit, not per row, if Deadline changed on Task List specifically - Parked
+  // shares this onEdit but shouldn't trigger a Task List re-sort. (A Progress-triggered move onto
+  // Task List, like "Ready" from Parked, already re-sorts on its own inside handleProgressChange.)
+  if (touchesDeadline && sheet.getName() === TASK_LIST_SHEET) {
+    Utilities.sleep(500); // small delay so the date entry visually registers before the sort moves the row
+    sortTaskListByDeadlineThenPriority();
+  }
+}
+
+function handleProgressChange(sheet, row, value, cols) {
+  var normalizedValue = normalizeHeader(value);
+  var progressCol = getCol(cols, COL_PROGRESS);
+
+  // Check the current value before touching anything. In a multi-row drag, an earlier row's
+  // move can shift this row's actual position before this edit runs, so `row` might not be
+  // pointing where we think. If it doesn't match, bail without writing anything (not even a
+  // timestamp) - the sweep in onEdit will catch it later.
+  var currentValue = sheet.getRange(row, progressCol).getValue();
+  if (normalizeHeader(currentValue) !== normalizedValue) return;
+
+  if (normalizedValue === normalizeHeader(STATUS_DONE) && getCol(cols, COL_TASK_COMPLETED)) {
+    sheet.getRange(row, getCol(cols, COL_TASK_COMPLETED)).setValue(new Date());
+  } else if (normalizedValue === normalizeHeader(STATUS_PENDING) && getCol(cols, COL_TASK_STARTED)) {
+    sheet.getRange(row, getCol(cols, COL_TASK_STARTED)).setValue(new Date());
+  }
+
+  var targetSheetName = getStatusRoute(value);
+  if (!targetSheetName) return;
+  if (targetSheetName === sheet.getName()) return; // already where it should be - don't move it or re-sort
+
+  var ss = sheet.getParent();
+  var targetSheet = ss.getSheetByName(targetSheetName);
+  if (!targetSheet) {
+    SpreadsheetApp.getUi().alert(
+      "Couldn't find a tab named \"" + targetSheetName + "\". The task was NOT moved — " +
+      "check that this tab exists and hasn't been renamed, then try again."
+    );
+    return;
+  }
+
+  var lastCol = sheet.getLastColumn();
+  var targetRow = targetSheet.getLastRow() + 1;
+  sheet.getRange(row, 1, 1, lastCol).copyTo(targetSheet.getRange(targetRow, 1));
+  sheet.deleteRow(row);
+  SpreadsheetApp.flush(); // force this delete to fully commit before we read the sheet again -
+                          // without it, the next read in this same run can still see the old
+                          // row layout and grab the wrong row
+
+  // Moving a row copies its conditional formatting too, which means Done would inherit Task
+  // List's red "overdue" rule - wrong once a task is actually finished. Strip any rule touching
+  // the Deadline column on Done right after every move.
+  if (targetSheetName === DONE_SHEET) {
+    var doneCols = getColumnMap(targetSheet, headerRowFor(DONE_SHEET));
+    var doneDeadlineCol = getCol(doneCols, COL_DEADLINE);
+    if (doneDeadlineCol) {
+      var keptRules = targetSheet.getConditionalFormatRules().filter(function(rule) {
+        return !rule.getRanges().some(function(r) {
+          return doneDeadlineCol >= r.getColumn() && doneDeadlineCol <= r.getLastColumn();
+        });
+      });
+      if (keptRules.length !== targetSheet.getConditionalFormatRules().length) {
+        targetSheet.setConditionalFormatRules(keptRules);
+      }
+    }
+  }
+
+  // A row landing on Task List (like "Ready" from Parked) always lands at the bottom regardless
+  // of its Deadline/Priority. Re-sort right away instead of leaving it out of place.
+  if (targetSheetName === TASK_LIST_SHEET) {
+    sortTaskListByDeadlineThenPriority();
+  }
+
+  SpreadsheetApp.getActiveSpreadsheet().toast("Moved to \"" + targetSheetName + "\"", "✓ Task updated", 4);
+}
+
+/** ====================== TAB SYNC ======================
+ *  Parked and Done get whole rows copied straight from Task List, so their columns have to
+ *  match exactly. This keeps them synced automatically - add or rename a column on Task List
+ *  and it shows up on both tabs too, shifting existing data along with it instead of overwriting.
+ */
+
+function syncColumnHeaders() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sourceSheet = ss.getSheetByName(TASK_LIST_SHEET);
+  var sourceHeaders = sourceSheet.getRange(TASK_LIST_HEADER_ROW, 1, 1, sourceSheet.getLastColumn()).getValues()[0];
+
+  var missingSheets = [];
+  MIRROR_SHEETS.forEach(function(sheetName) {
+    var targetSheet = ss.getSheetByName(sheetName);
+    if (!targetSheet) {
+      missingSheets.push(sheetName);
+      return;
+    }
+    syncSheetColumnsTo(targetSheet, sourceHeaders);
+  });
+
+  if (missingSheets.length > 0) {
+    SpreadsheetApp.getUi().alert(
+      "Couldn't find these tabs to sync columns to:\n" +
+      missingSheets.map(function(name) { return "• \"" + name + "\""; }).join("\n") +
+      "\n\nCheck for typos or a renamed tab, then try again."
+    );
+  }
+}
+
+// Goes column by column and makes the target tab match Task List. Task List always wins.
+// Three cases: the header already exists somewhere else on this tab (it got reordered - move
+// the whole column into place), what's currently here matches the NEXT expected header (a
+// column got inserted on Task List - insert one here too), or neither (it just got renamed -
+// overwrite it in place).
+function syncSheetColumnsTo(targetSheet, sourceHeaders) {
+  var headerRow = OTHER_SHEETS_HEADER_ROW;
+
+  for (var i = 0; i < sourceHeaders.length; i++) {
+    var col = i + 1;
+    var expected = normalizeHeader(sourceHeaders[i]);
+    var currentLastCol = targetSheet.getLastColumn();
+    var current = col <= currentLastCol ? normalizeHeader(targetSheet.getRange(headerRow, col).getValue()) : "";
+
+    if (current === expected) continue; // already correct at this position
+
+    var existingCols = getColumnMap(targetSheet, headerRow);
+    if (existingCols.hasOwnProperty(expected)) {
+      var foundCol = existingCols[expected];
+      var columnToMove = targetSheet.getRange(1, foundCol, targetSheet.getMaxRows(), 1);
+      targetSheet.moveColumns(columnToMove, col); // carries data, formatting, and the header text together
+      continue;
+    }
+
+    var nextExpected = i + 1 < sourceHeaders.length ? normalizeHeader(sourceHeaders[i + 1]) : null;
+    var looksLikeInsertion = current !== "" && current === nextExpected;
+
+    if (looksLikeInsertion) {
+      targetSheet.insertColumnBefore(col); // shifts this column and everything after it right by one
+    }
+    targetSheet.getRange(headerRow, col).setValue(sourceHeaders[i]);
+  }
+
+  // Anything past Task List's column count is this tab's own business - a "Met Deadline"
+  // tracker only Done needs, say. Never touched, never flagged.
+}
+
+/** ====================== COLUMN LOOKUP ======================
+ *  Reads the header row once and maps header text to a column number,
+ *  so reordering or inserting columns doesn't break the automation.
+ */
+
+// Trims whitespace and lowercases, so "To Add"/" To Add "/"TO ADD" all match the same column.
+function normalizeHeader(text) {
+  return String(text).trim().toLowerCase();
+}
+
+// Builds header text -> column number for one sheet's header row.
+function getColumnMap(sheet, headerRow) {
+  var lastCol = sheet.getLastColumn();
+  var headers = sheet.getRange(headerRow, 1, 1, lastCol).getValues()[0];
+  var map = {};
+  headers.forEach(function(name, i) {
+    var normalized = normalizeHeader(name);
+    // If a header appears twice (like a reference list column reusing a name), the leftmost
+    // one wins - that's almost always the real data column.
+    if (normalized !== "" && !map.hasOwnProperty(normalized)) map[normalized] = i + 1;
+  });
+  return map;
+}
+
+// Looks up a column by header name, normalizing the same way getColumnMap does.
+function getCol(colMap, name) {
+  return colMap[normalizeHeader(name)];
+}
+
+// Checks that every required header name was found in colMap; alerts and returns false if not.
+function requireColumns(colMap, requiredNames, sheetLabel, headerRow) {
+  var missing = requiredNames.filter(function(name) { return !getCol(colMap, name); });
+  if (missing.length === 0) return true;
+  SpreadsheetApp.getUi().alert(
+    "Couldn't find these column headers on \"" + sheetLabel + "\" row " + headerRow + ":\n" +
+    missing.map(function(name) { return "• \"" + name + "\""; }).join("\n") +
+    "\n\nCheck for typos, extra spaces, or a different header row, then try again."
+  );
+  return false;
+}
+
+/** ====================== RECURRENCE CALENDAR MATH ======================
+ *  Plain calendar dates only, no timezone math. computeNextOccurrence is the entry point -
+ *  give it a rule and a starting date, it finds the next date that satisfies the rule.
+ */
+
+function computeNextOccurrence(position, dayName, period, notBefore) {
+  var period_ = canonicalPeriod(period);
+
+  // A number or "Last" in the Day cell only works with the Month period - there's only one
+  // possible date per month either way, so Position gets ignored here, same as it's already
+  // ignored for Week.
+  if (period_ === PERIOD_MONTH) {
+    var dayOfMonth = parseDayOfMonth(dayName);
+    if (dayOfMonth !== null) {
+      return nextDayOfMonthOnOrAfter(notBefore, dayOfMonth);
+    }
+  }
+
+  var dayIndex = DAY_NAME_TO_INDEX[normalizeHeader(dayName)];
+  if (dayIndex === undefined) return null;
+
+  if (period_ === PERIOD_WEEK) {
+    return nextWeekdayOnOrAfter(notBefore, dayIndex);
+  }
+
+  var boundsFn, advanceFn;
+  if (period_ === PERIOD_MONTH) { boundsFn = getMonthBounds; advanceFn = advanceMonthBounds; }
+  else if (period_ === PERIOD_QUARTER) { boundsFn = getQuarterBounds; advanceFn = advanceQuarterBounds; }
+  else if (period_ === PERIOD_YEAR) { boundsFn = getYearBounds; advanceFn = advanceYearBounds; }
+  else return null;
+
+  var bounds = boundsFn(notBefore);
+  for (var i = 0; i < 5; i++) { // safety bound - real answer always resolves within 1-2 iterations
+    var candidate = nthWeekdayInRange(bounds.start, bounds.end, position, dayIndex);
+    if (candidate && candidate >= notBefore) return candidate;
+    bounds = advanceFn(bounds);
+  }
+  return null;
+}
+
+// Returns 1-31 for a number, 32 for "Last" (32 always overflows any real month, so it clamps
+// down to whatever the actual last day is - same code handles both), or null if this is a
+// weekday name instead.
+function parseDayOfMonth(dayName) {
+  var normalized = normalizeHeader(dayName);
+  if (normalized === "last") return 32;
+  var num = Number(normalized);
+  if (normalized !== "" && !isNaN(num) && Number.isInteger(num) && num >= 1 && num <= 31) return num;
+  return null;
+}
+
+// Finds the next date on or after notBefore that falls on dayOfMonth, clamped to the real last
+// day of the month when it's too big (31 in February becomes the 28th/29th).
+function nextDayOfMonthOnOrAfter(notBefore, dayOfMonth) {
+  var y = notBefore.getFullYear();
+  var startMonth = notBefore.getMonth();
+  for (var i = 0; i < 13; i++) { // safety bound - real answer always resolves within 1-2 months
+    var m = startMonth + i;
+    var lastDayInMonth = new Date(y, m + 1, 0).getDate(); // "day 0" of next month = last day of this one
+    var candidate = new Date(y, m, Math.min(dayOfMonth, lastDayInMonth));
+    if (candidate >= notBefore) return candidate;
+  }
+  return null;
+}
+
+function nextWeekdayOnOrAfter(notBefore, dayIndex) {
+  var d = new Date(notBefore);
+  var diff = (dayIndex - d.getDay() + 7) % 7;
+  d.setDate(d.getDate() + diff);
+  return d;
+}
+
+// Every occurrence of dayIndex within [start, end], then picks the requested position from that list.
+function nthWeekdayInRange(start, end, position, dayIndex) {
+  var occurrences = [];
+  var d = new Date(start);
+  var diff = (dayIndex - d.getDay() + 7) % 7;
+  d.setDate(d.getDate() + diff);
+  while (d <= end) {
+    occurrences.push(new Date(d));
+    d.setDate(d.getDate() + 7);
+  }
+  if (occurrences.length === 0) return null;
+  var normalizedPosition = normalizeHeader(position);
+  if (LAST_POSITION_NAMES.indexOf(normalizedPosition) !== -1) {
+    return occurrences[occurrences.length - 1];
+  }
+  var positionNum = POSITION_NUMBERS[normalizedPosition];
+  return positionNum ? (occurrences[positionNum - 1] || null) : null;
+}
+
+function getMonthBounds(refDate) {
+  var y = refDate.getFullYear(), m = refDate.getMonth();
+  return { start: new Date(y, m, 1), end: new Date(y, m + 1, 0) };
+}
+function advanceMonthBounds(bounds) {
+  return getMonthBounds(new Date(bounds.start.getFullYear(), bounds.start.getMonth() + 1, 1));
+}
+
+function getQuarterBounds(refDate) {
+  var y = refDate.getFullYear();
+  var qStartMonth = Math.floor(refDate.getMonth() / 3) * 3;
+  return { start: new Date(y, qStartMonth, 1), end: new Date(y, qStartMonth + 3, 0) };
+}
+function advanceQuarterBounds(bounds) {
+  return getQuarterBounds(new Date(bounds.end.getFullYear(), bounds.end.getMonth() + 1, 1));
+}
+
+function getYearBounds(refDate) {
+  var y = refDate.getFullYear();
+  return { start: new Date(y, 0, 1), end: new Date(y, 11, 31) };
+}
+function advanceYearBounds(bounds) {
+  return getYearBounds(new Date(bounds.end.getFullYear() + 1, 0, 1));
+}
+
+function dateOnly(d) {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+function todayDateOnly() {
+  return dateOnly(new Date());
+}
+
+// The earliest date a NEXT occurrence search should consider: the day after Last Added, or
+// today if this rule has never fired yet.
+function computeFloorDate(lastAdded) {
+  if (lastAdded instanceof Date) {
+    var floor = dateOnly(lastAdded);
+    floor.setDate(floor.getDate() + 1);
+    return floor;
+  }
+  return todayDateOnly();
+}
+
+/** ====================== LIVE NEXT ADD (Recurring sheet onEdit) ====================== */
+
+function updateNextAddForEditedRows(sheet, range) {
+  var cols = getColumnMap(sheet, OTHER_SHEETS_HEADER_ROW);
+  var positionCol = getCol(cols, COL_REC_POSITION);
+  var dayCol = getCol(cols, COL_REC_DAY);
+  var periodCol = getCol(cols, COL_REC_PERIOD);
+  var lastAddedCol = getCol(cols, COL_REC_LAST_ADDED);
+  var nextAddCol = getCol(cols, COL_REC_NEXT_ADD);
+  if (!positionCol || !dayCol || !periodCol || !nextAddCol) {
+    // Can't tell if this edit even touches the rule columns when one's missing, so alert now
+    // instead of silently doing nothing - almost any edit on Recurring is probably related.
+    requireColumns(cols, [COL_REC_POSITION, COL_REC_DAY, COL_REC_PERIOD, COL_REC_LAST_ADDED, COL_REC_NEXT_ADD], RECURRING_SHEET, OTHER_SHEETS_HEADER_ROW);
+    return;
+  }
+
+  var startCol = range.getColumn();
+  var endCol = startCol + range.getNumColumns() - 1;
+  var touchesRule = (positionCol >= startCol && positionCol <= endCol) ||
+                     (dayCol >= startCol && dayCol <= endCol) ||
+                     (periodCol >= startCol && periodCol <= endCol);
+  if (!touchesRule) return;
+
+  var startRow = range.getRow();
+  var numRows = range.getNumRows();
+  for (var i = 0; i < numRows; i++) {
+    var row = startRow + i;
+    if (row <= OTHER_SHEETS_HEADER_ROW) continue; // never touch the header row
+    refreshNextAddForRow(sheet, row, positionCol, dayCol, periodCol, lastAddedCol, nextAddCol);
+  }
+}
+
+function refreshNextAddForRow(sheet, row, positionCol, dayCol, periodCol, lastAddedCol, nextAddCol) {
+  var period = sheet.getRange(row, periodCol).getValue();
+  if (!period) { sheet.getRange(row, nextAddCol).setValue(""); return; }
+
+  if (canonicalPeriod(period) === PERIOD_DAY) {
+    sheet.getRange(row, nextAddCol).setValue("Daily (per trigger schedule)");
+    return;
+  }
+
+  var position = sheet.getRange(row, positionCol).getValue();
+  var day = sheet.getRange(row, dayCol).getValue();
+  // Position only matters for a weekday-based Month/Quarter/Year rule. A week only has one of
+  // each weekday, so Week rules just need Day. A plain day-of-month value like "5" or "Last"
+  // only has one possible date too, so Position doesn't matter there either.
+  var needsPosition = canonicalPeriod(period) !== PERIOD_WEEK && parseDayOfMonth(day) === null;
+  if ((needsPosition && !position) || !day) { sheet.getRange(row, nextAddCol).setValue(""); return; }
+
+  var lastAdded = lastAddedCol ? sheet.getRange(row, lastAddedCol).getValue() : "";
+  var nextDate = computeNextOccurrence(position, day, period, computeFloorDate(lastAdded));
+  sheet.getRange(row, nextAddCol).setValue(nextDate || "");
+}
+
+/** ====================== RECURRING TASKS ====================== */
+
+function copyRecurringTasks() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var recurringSheet = ss.getSheetByName(RECURRING_SHEET);
+  var taskListSheet = ss.getSheetByName(TASK_LIST_SHEET);
+
+  var recCols = getColumnMap(recurringSheet, OTHER_SHEETS_HEADER_ROW);
+  var taskListCols = getColumnMap(taskListSheet, TASK_LIST_HEADER_ROW);
+
+  var recRequired = [COL_REC_POSITION, COL_REC_DAY, COL_REC_PERIOD, COL_REC_LAST_ADDED, COL_REC_NEXT_ADD];
+  if (!requireColumns(recCols, recRequired, RECURRING_SHEET, OTHER_SHEETS_HEADER_ROW)) return;
+  if (!requireColumns(taskListCols, [COL_TASK_ADDED, COL_DEADLINE], TASK_LIST_SHEET, TASK_LIST_HEADER_ROW)) return;
+
+  // Global pause - nothing fires, for any rule, while today is before the Resume Date.
+  var resumeDateValue = recurringSheet.getRange(RESUME_DATE_CELL).getValue();
+  var today = todayDateOnly();
+  if (resumeDateValue instanceof Date && dateOnly(resumeDateValue) > today) {
+    ss.toast(
+      "Recurring tasks are paused until " + Utilities.formatDate(resumeDateValue, ss.getSpreadsheetTimeZone(), "MM/dd/yyyy") + ".",
+      "Recurring Tasks", 4
+    );
+    return;
+  }
+
+  // Any header that exists on both sheets gets copied automatically. Add a matching column to
+  // both tabs and it just works, no code changes needed.
+  var sharedFields = Object.keys(taskListCols).filter(function(name) {
+    return recCols.hasOwnProperty(name);
+  });
+
+  if (sharedFields.length === 0) {
+    SpreadsheetApp.getUi().alert(
+      "Couldn't find any matching column headers between \"" + RECURRING_SHEET + "\" and \"" + TASK_LIST_SHEET +
+      "\". Recurring tasks need at least one shared column (like \"Task List\" or \"Progress\") to know what to copy."
+    );
+    return;
+  }
+
+  var lastRow = recurringSheet.getLastRow();
+  var numDataRows = lastRow - OTHER_SHEETS_HEADER_ROW;
+  if (numDataRows <= 0) return;
+
+  var positionCol = getCol(recCols, COL_REC_POSITION);
+  var dayCol = getCol(recCols, COL_REC_DAY);
+  var periodCol = getCol(recCols, COL_REC_PERIOD);
+  var lastAddedCol = getCol(recCols, COL_REC_LAST_ADDED);
+  var nextAddCol = getCol(recCols, COL_REC_NEXT_ADD);
+  var daysToCompleteCol = getCol(recCols, COL_DAYS_TO_COMPLETE); // optional field
+
+  var todayIsDailyTriggerDay = isTodayACheckedTriggerDay(recurringSheet, recCols);
+
+  var newTaskRows = [];   // { fields: [...], deadline: Date|null }
+  var recUpdates = [];    // { row, lastAdded: Date, nextAdd: Date|string }
+
+  for (var r = 0; r < numDataRows; r++) {
+    var row = OTHER_SHEETS_HEADER_ROW + 1 + r;
+    var period = recurringSheet.getRange(row, periodCol).getValue();
+    if (!period) continue; // unconfigured row
+
+    var lastAdded = recurringSheet.getRange(row, lastAddedCol).getValue();
+    var due = false;
+    var targetDate = null; // the date this occurrence was actually due, used for the Deadline calc
+    var position, day;
+
+    if (canonicalPeriod(period) === PERIOD_DAY) {
+      var lastAddedIsToday = lastAdded instanceof Date && dateOnly(lastAdded).getTime() === today.getTime();
+      due = todayIsDailyTriggerDay && !lastAddedIsToday;
+      targetDate = today;
+    } else {
+      position = recurringSheet.getRange(row, positionCol).getValue();
+      day = recurringSheet.getRange(row, dayCol).getValue();
+      var needsPosition = canonicalPeriod(period) !== PERIOD_WEEK && parseDayOfMonth(day) === null;
+      if ((needsPosition && !position) || !day) continue; // unconfigured row
+
+      var nextOccurrence = computeNextOccurrence(position, day, period, computeFloorDate(lastAdded));
+      if (!nextOccurrence) continue;
+      due = nextOccurrence <= today;
+      targetDate = nextOccurrence;
+    }
+
+    if (!due) continue;
+
+    // The Website/Link column gets handled separately below with copyTo instead of a plain
+    // value - getValue()/setValue() would just grab the text and lose the Smart Chip.
+    var fields = sharedFields.map(function(name) {
+      if (name === normalizeHeader(COL_LINK)) return null;
+      return recurringSheet.getRange(row, recCols[name]).getValue();
+    });
+
+    // Days to Complete counts from the day the task actually gets added to Task List, not the
+    // day it was technically due - those are different whenever a rule is catching up from
+    // being paused, since "today" is the only date the customer actually has to work with.
+    var deadlineDate = null;
+    if (daysToCompleteCol) {
+      var daysToComplete = recurringSheet.getRange(row, daysToCompleteCol).getValue();
+      if (daysToComplete !== "" && !isNaN(daysToComplete)) {
+        deadlineDate = new Date(today);
+        deadlineDate.setDate(deadlineDate.getDate() + (Number(daysToComplete) - 1));
+      }
+    }
+
+    newTaskRows.push({ fields: fields, deadline: deadlineDate, sourceRow: row });
+
+    var newNextAdd = canonicalPeriod(period) === PERIOD_DAY
+      ? "Daily (per trigger schedule)"
+      : (computeNextOccurrence(position, day, period, computeFloorDate(today)) || "");
+    recUpdates.push({ row: row, lastAdded: today, nextAdd: newNextAdd });
+  }
+
+  if (newTaskRows.length === 0) {
+    ss.toast("No additional recurring tasks needed today.", "Recurring Tasks", 4);
+    return;
+  }
+
+  var timeZone = getUserTimeZone();
+  var nowFormatted = Utilities.formatDate(new Date(), timeZone, "yyyy-MM-dd HH:mm:ss");
+  var nextRow = taskListSheet.getLastRow() + 1;
+  var taskAddedCol = getCol(taskListCols, COL_TASK_ADDED);
+  var deadlineColOnTaskList = getCol(taskListCols, COL_DEADLINE);
+  var linkColOnRecurring = getCol(recCols, COL_LINK);
+  var linkColOnTaskList = getCol(taskListCols, COL_LINK);
+
+  newTaskRows.forEach(function(entry, i) {
+    var targetRow = nextRow + i;
+    sharedFields.forEach(function(name, fieldIndex) {
+      if (name === normalizeHeader(COL_LINK)) return; // handled below via copyTo
+      taskListSheet.getRange(targetRow, taskListCols[name]).setValue(entry.fields[fieldIndex]);
+    });
+    if (linkColOnRecurring && linkColOnTaskList) {
+      recurringSheet.getRange(entry.sourceRow, linkColOnRecurring)
+        .copyTo(taskListSheet.getRange(targetRow, linkColOnTaskList));
+    }
+    taskListSheet.getRange(targetRow, taskAddedCol).setValue(nowFormatted);
+    if (entry.deadline) {
+      taskListSheet.getRange(targetRow, deadlineColOnTaskList).setValue(entry.deadline);
+    }
+  });
+
+  recUpdates.forEach(function(u) {
+    recurringSheet.getRange(u.row, lastAddedCol).setValue(u.lastAdded);
+    recurringSheet.getRange(u.row, nextAddCol).setValue(u.nextAdd);
+  });
+
+  sortTaskListByDeadlineThenPriority();
+
+  ss.toast(
+    "Added " + newTaskRows.length + " recurring task(s) and re-sorted Task List.", "✓ Recurring Tasks", 4
+  );
+}
+
+// Checks whether today is one of the checked days in the trigger table. This is what gates
+// Daily tasks specifically.
+function isTodayACheckedTriggerDay(recurringSheet, recCols) {
+  var enabledCol = getCol(recCols, COL_TRIGGER_ENABLED);
+  var dayCol = getCol(recCols, COL_TRIGGER_DAY);
+  if (!enabledCol || !dayCol) return false;
+
+  var todayName = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][new Date().getDay()];
+  var startCol = Math.min(enabledCol, dayCol);
+  var endCol = Math.max(enabledCol, dayCol);
+  var data = recurringSheet.getRange(OTHER_SHEETS_HEADER_ROW + 1, startCol, TRIGGER_TABLE_ROWS, endCol - startCol + 1).getValues();
+
+  for (var i = 0; i < data.length; i++) {
+    var enabled = data[i][enabledCol - startCol];
+    var dayName = data[i][dayCol - startCol];
+    if (enabled === true && normalizeHeader(dayName) === normalizeHeader(todayName)) return true;
+  }
+  return false;
+}
+
+/** ====================== TASK BUNDLES ======================
+ *  One-click groups of tasks (like "New Hire" = 8 setup tasks), added all at once from the
+ *  Task Bundles menu. Not scheduled - you trigger it by hand, and it's safe to run as many
+ *  times as you want. Every click adds a fresh copy, there's no "already added" check.
+ */
+
+// Live, de-duplicated list of bundle names, top to bottom - same pattern as
+// getPriorityOrder(). Drives both the menu (which bundle goes in which slot) and validation.
+function getTaskBundleProjectOptions() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(TASK_BUNDLES_SHEET);
+  if (!sheet) return [];
+
+  var cols = getColumnMap(sheet, OTHER_SHEETS_HEADER_ROW);
+  var col = getCol(cols, COL_BUNDLE_PROJECT_OPTIONS);
+  if (!col) return [];
+
+  var lastRow = sheet.getLastRow();
+  var numRows = lastRow - OTHER_SHEETS_HEADER_ROW;
+  if (numRows <= 0) return [];
+
+  var seen = {};
+  return sheet.getRange(OTHER_SHEETS_HEADER_ROW + 1, col, numRows, 1).getValues()
+    .map(function(row) { return row[0]; })
+    .filter(function(v) {
+      if (v === "" || seen[normalizeHeader(v)]) return false;
+      seen[normalizeHeader(v)] = true;
+      return true;
+    });
+}
+
+// Rebuilds the Task Bundles menu from the current Project Options list. Runs automatically on
+// open, and there's a "Refresh" menu item too since Sheets menus don't update mid-session on
+// their own when you add a new bundle name.
+function buildTaskBundlesMenu() {
+  var ui = SpreadsheetApp.getUi();
+  var projects = getTaskBundleProjectOptions();
+  var menu = ui.createMenu('Task Bundles');
+
+  if (projects.length > MAX_TASK_BUNDLE_SLOTS) {
+    SpreadsheetApp.getActiveSpreadsheet().toast(
+      "Only the first " + MAX_TASK_BUNDLE_SLOTS + " bundles can have their own menu item - " +
+      "\"" + projects[MAX_TASK_BUNDLE_SLOTS] + "\" and beyond won't show up in the menu.",
+      "⚠ Task Bundles", 6
+    );
+  }
+
+  projects.slice(0, MAX_TASK_BUNDLE_SLOTS).forEach(function(name, i) {
+    menu.addItem(name, "runTaskBundleSlot" + (i + 1));
+  });
+  if (projects.length > 0) menu.addSeparator();
+  menu.addItem('Refresh Task Bundles Menu', 'buildTaskBundlesMenu');
+  menu.addToUi();
+}
+
+// Menu items have to bind to a function that already exists, so this is a fixed pool of 15
+// slots - each one just runs whatever bundle currently sits at that spot in the list. Need
+// more than 15 bundles? Raise MAX_TASK_BUNDLE_SLOTS above and add matching slots here.
+function runTaskBundleAtIndex(index) {
+  var projectName = getTaskBundleProjectOptions()[index];
+  if (!projectName) return; // menu is stale (list shrank since it was last built) - nothing to do
+  addTaskBundle(projectName);
+}
+function runTaskBundleSlot1() { runTaskBundleAtIndex(0); }
+function runTaskBundleSlot2() { runTaskBundleAtIndex(1); }
+function runTaskBundleSlot3() { runTaskBundleAtIndex(2); }
+function runTaskBundleSlot4() { runTaskBundleAtIndex(3); }
+function runTaskBundleSlot5() { runTaskBundleAtIndex(4); }
+function runTaskBundleSlot6() { runTaskBundleAtIndex(5); }
+function runTaskBundleSlot7() { runTaskBundleAtIndex(6); }
+function runTaskBundleSlot8() { runTaskBundleAtIndex(7); }
+function runTaskBundleSlot9() { runTaskBundleAtIndex(8); }
+function runTaskBundleSlot10() { runTaskBundleAtIndex(9); }
+function runTaskBundleSlot11() { runTaskBundleAtIndex(10); }
+function runTaskBundleSlot12() { runTaskBundleAtIndex(11); }
+function runTaskBundleSlot13() { runTaskBundleAtIndex(12); }
+function runTaskBundleSlot14() { runTaskBundleAtIndex(13); }
+function runTaskBundleSlot15() { runTaskBundleAtIndex(14); }
+
+// Copies every row matching this bundle's name onto Task List - same field-matching, Days to
+// Complete, and chip-preserving Website copy as Add Recurring, just with no date math and no
+// "already added" tracking. Bundles are meant to be reusable - the next new hire reruns
+// "New Hire" again on purpose.
+function addTaskBundle(projectName) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var bundlesSheet = ss.getSheetByName(TASK_BUNDLES_SHEET);
+  var taskListSheet = ss.getSheetByName(TASK_LIST_SHEET);
+  if (!bundlesSheet || !taskListSheet) {
+    SpreadsheetApp.getUi().alert("Couldn't find the \"" + TASK_BUNDLES_SHEET + "\" or \"" + TASK_LIST_SHEET + "\" tab.");
+    return;
+  }
+
+  var bundleCols = getColumnMap(bundlesSheet, OTHER_SHEETS_HEADER_ROW);
+  var taskListCols = getColumnMap(taskListSheet, TASK_LIST_HEADER_ROW);
+  if (!requireColumns(bundleCols, [COL_BUNDLE_PROJECT], TASK_BUNDLES_SHEET, OTHER_SHEETS_HEADER_ROW)) return;
+  if (!requireColumns(taskListCols, [COL_TASK_ADDED], TASK_LIST_SHEET, TASK_LIST_HEADER_ROW)) return;
+
+  var sharedFields = Object.keys(taskListCols).filter(function(name) {
+    return bundleCols.hasOwnProperty(name);
+  });
+  if (sharedFields.length === 0) {
+    SpreadsheetApp.getUi().alert(
+      "Couldn't find any matching column headers between \"" + TASK_BUNDLES_SHEET + "\" and \"" + TASK_LIST_SHEET +
+      "\". Task Bundles need at least one shared column (like \"Task List\") to know what to copy."
+    );
+    return;
+  }
+
+  var projectCol = getCol(bundleCols, COL_BUNDLE_PROJECT);
+  var lastRow = bundlesSheet.getLastRow();
+  var numRows = lastRow - OTHER_SHEETS_HEADER_ROW;
+  if (numRows <= 0) {
+    SpreadsheetApp.getUi().alert(
+      "No tasks found with a \"" + COL_BUNDLE_PROJECT + "\" of \"" + projectName + "\" on \"" + TASK_BUNDLES_SHEET + "\"."
+    );
+    return;
+  }
+
+  // Read the whole Task Bundles block in one shot and match rows + pull field values off that,
+  // instead of round-tripping per cell.
+  var bundlesLastCol = bundlesSheet.getLastColumn();
+  var bundlesData = bundlesSheet.getRange(OTHER_SHEETS_HEADER_ROW + 1, 1, numRows, bundlesLastCol).getValues();
+
+  var normalizedProject = normalizeHeader(projectName);
+  var matchingRowIndexes = []; // 0-based index into bundlesData
+  for (var r = 0; r < bundlesData.length; r++) {
+    var rowProject = bundlesData[r][projectCol - 1];
+    if (rowProject && normalizeHeader(rowProject) === normalizedProject) matchingRowIndexes.push(r);
+  }
+
+  if (matchingRowIndexes.length === 0) {
+    SpreadsheetApp.getUi().alert(
+      "No tasks found with a \"" + COL_BUNDLE_PROJECT + "\" of \"" + projectName + "\" on \"" + TASK_BUNDLES_SHEET + "\"."
+    );
+    return;
+  }
+
+  var daysToCompleteCol = getCol(bundleCols, COL_DAYS_TO_COMPLETE); // optional field, same as Recurring
+  var today = todayDateOnly();
+  var timeZone = getUserTimeZone();
+  var nowFormatted = Utilities.formatDate(new Date(), timeZone, "yyyy-MM-dd HH:mm:ss");
+  var taskAddedCol = getCol(taskListCols, COL_TASK_ADDED);
+  var deadlineColOnTaskList = getCol(taskListCols, COL_DEADLINE);
+  var linkColOnBundles = getCol(bundleCols, COL_LINK);
+  var linkColOnTaskList = getCol(taskListCols, COL_LINK);
+  var nextRow = taskListSheet.getLastRow() + 1;
+  var taskListLastCol = taskListSheet.getLastColumn();
+
+  // Build every new row in memory first, then write it all in one call - that's what actually
+  // makes this fast, and why a row now appears fully filled in at once instead of field by field.
+  var outputRows = matchingRowIndexes.map(function(rowIndex) {
+    var sourceRowValues = bundlesData[rowIndex];
+    var outRow = new Array(taskListLastCol).fill("");
+    sharedFields.forEach(function(name) {
+      if (name === normalizeHeader(COL_LINK)) return; // handled below via copyTo, preserves Smart Chips
+      outRow[taskListCols[name] - 1] = sourceRowValues[bundleCols[name] - 1];
+    });
+    if (taskAddedCol) outRow[taskAddedCol - 1] = nowFormatted;
+    if (daysToCompleteCol && deadlineColOnTaskList) {
+      var daysToComplete = sourceRowValues[daysToCompleteCol - 1];
+      if (daysToComplete !== "" && !isNaN(daysToComplete)) {
+        var deadlineDate = new Date(today);
+        deadlineDate.setDate(deadlineDate.getDate() + (Number(daysToComplete) - 1));
+        outRow[deadlineColOnTaskList - 1] = deadlineDate;
+      }
+    }
+    return outRow;
+  });
+
+  taskListSheet.getRange(nextRow, 1, outputRows.length, taskListLastCol).setValues(outputRows);
+
+  // Website still needs a real cell copy to keep its Smart Chip - a plain values array can't
+  // hold a chip. Still just one call per row though, not one per field.
+  if (linkColOnBundles && linkColOnTaskList) {
+    matchingRowIndexes.forEach(function(rowIndex, i) {
+      var sourceRow = OTHER_SHEETS_HEADER_ROW + 1 + rowIndex;
+      var targetRow = nextRow + i;
+      bundlesSheet.getRange(sourceRow, linkColOnBundles)
+        .copyTo(taskListSheet.getRange(targetRow, linkColOnTaskList));
+    });
+  }
+
+  sortTaskListByDeadlineThenPriority();
+  SpreadsheetApp.getActiveSpreadsheet().toast(
+    "Added " + matchingRowIndexes.length + " task(s) from \"" + projectName + "\".", "✓ Task Bundle", 4
+  );
+}
+
+/** ====================== SORTING ====================== */
+
+// Reads your live Priority Options list, top to bottom. Reorder or edit that list and sort
+// order updates automatically, no code changes. Falls back to PRIORITY_ORDER above only if
+// that column is missing or empty.
+function getPriorityOrder() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(RECURRING_SHEET);
+  if (!sheet) return PRIORITY_ORDER;
+
+  var cols = getColumnMap(sheet, OTHER_SHEETS_HEADER_ROW);
+  var col = getCol(cols, COL_PRIORITY_OPTIONS);
+  if (!col) {
+    SpreadsheetApp.getUi().alert(
+      "Couldn't find a \"" + COL_PRIORITY_OPTIONS + "\" column on \"" + RECURRING_SHEET + "\", so sorting is " +
+      "using the built-in default Priority order instead of your custom one.\n\n" +
+      "Rename that column's header to exactly \"" + COL_PRIORITY_OPTIONS + "\" to fix this."
+    );
+    return PRIORITY_ORDER;
+  }
+
+  var lastRow = sheet.getLastRow();
+  var numRows = lastRow - OTHER_SHEETS_HEADER_ROW;
+  if (numRows <= 0) return PRIORITY_ORDER;
+
+  var values = sheet.getRange(OTHER_SHEETS_HEADER_ROW + 1, col, numRows, 1).getValues()
+    .map(function(row) { return row[0]; })
+    .filter(function(v) { return v !== ""; });
+
+  return values.length > 0 ? values : PRIORITY_ORDER;
+}
+
+// Rank for a cell's text: position in orderList (0 = highest). Unrecognized or blank values
+// sort to the very end instead of breaking the sort.
+function priorityRank(value, orderList) {
+  var normalized = normalizeHeader(value);
+  for (var i = 0; i < orderList.length; i++) {
+    if (normalizeHeader(orderList[i]) === normalized) return i;
+  }
+  return orderList.length;
+}
+
+// Sheets' built-in sort only does alphabetical/numeric order, which can't express a custom
+// priority ranking. This physically moves rows instead (the same thing that happens when you
+// drag a row in the UI) rather than rewriting cell values - rewriting values would flatten any
+// Smart Chip in the row (like in Website) down to plain text.
+function sortTaskListByDeadlineThenPriority() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(TASK_LIST_SHEET);
+  var cols = getColumnMap(sheet, TASK_LIST_HEADER_ROW);
+
+  if (!requireColumns(cols, [COL_PRIORITY, COL_DEADLINE], TASK_LIST_SHEET, TASK_LIST_HEADER_ROW)) return;
+
+  var firstDataRow = TASK_LIST_HEADER_ROW + 1;
+  var lastRow = sheet.getLastRow();
+  var numRows = lastRow - TASK_LIST_HEADER_ROW;
+  var numCols = sheet.getLastColumn();
+  if (numRows <= 1) return; // nothing to reorder
+
+  var deadlineCol = getCol(cols, COL_DEADLINE);
+  var priorityCol = getCol(cols, COL_PRIORITY);
+  var priorityOrder = getPriorityOrder(); // read once, not per-row comparison
+
+  // Only read the two sort-key columns, never the whole row, so nothing richer ever passes
+  // through a plain array.
+  var deadlineValues = sheet.getRange(firstDataRow, deadlineCol, numRows, 1).getValues();
+  var priorityValues = sheet.getRange(firstDataRow, priorityCol, numRows, 1).getValues();
+
+  var entries = [];
+  for (var i = 0; i < numRows; i++) {
+    entries.push({
+      originalOffset: i, // 0-based offset from firstDataRow, BEFORE any moves
+      deadline: deadlineValues[i][0] instanceof Date ? deadlineValues[i][0].getTime() : Infinity, // blank -> last
+      priority: priorityRank(priorityValues[i][0], priorityOrder)
+    });
+  }
+
+  var sortedEntries = entries.slice().sort(function(a, b) {
+    if (a.deadline !== b.deadline) return a.deadline - b.deadline;
+    return a.priority - b.priority;
+  });
+
+  // currentOffset[originalOffset] tracks where that row actually sits right now (0-based, relative
+  // to firstDataRow) as moves happen - every move shifts everything between the old and new spot.
+  var currentOffset = entries.map(function(e) { return e.originalOffset; });
+
+  for (var target = 0; target < sortedEntries.length; target++) {
+    var wantedOriginalOffset = sortedEntries[target].originalOffset;
+    var fromOffset = currentOffset[wantedOriginalOffset];
+    if (fromOffset === target) continue; // already correctly placed
+
+    // Rows [0, target) are already finalized from earlier iterations and never revisited, so the
+    // row we want for `target` is always still somewhere at or after it (fromOffset >= target) -
+    // this only ever moves a row UPWARD, never down.
+    var sourceRow = firstDataRow + fromOffset;
+    var destRow = firstDataRow + target;
+    sheet.moveRows(sheet.getRange(sourceRow, 1, 1, numCols), destRow);
+
+    // Everything that was sitting in [target, fromOffset) got pushed down by one row to make room.
+    for (var idx = 0; idx < currentOffset.length; idx++) {
+      if (currentOffset[idx] >= target && currentOffset[idx] < fromOffset) currentOffset[idx]++;
+    }
+    currentOffset[wantedOriginalOffset] = target;
+  }
+
+  ss.toast("Sorted: Deadline > Priority", "Task List", 4);
+}
+
+/** ====================== OVERDUE DEADLINE HIGHLIGHTING ======================
+ *  Uses Sheets' own conditional formatting instead of script-driven coloring, so it stays
+ *  accurate every day on its own - no trigger needed.
+ */
+
+function setUpOverdueDeadlineFormatting() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var problems = [];
+  [TASK_LIST_SHEET, PARKED_SHEET].forEach(function(sheetName) {
+    var sheet = ss.getSheetByName(sheetName);
+    if (!sheet) { problems.push("Couldn't find a tab named \"" + sheetName + "\"."); return; }
+
+    var headerRow = headerRowFor(sheetName);
+    var cols = getColumnMap(sheet, headerRow);
+    var deadlineCol = getCol(cols, COL_DEADLINE);
+    if (!deadlineCol) {
+      problems.push("Couldn't find \"" + COL_DEADLINE + "\" on \"" + sheetName + "\" row " + headerRow + ".");
+      return;
+    }
+
+    var firstDataRow = headerRow + 1;
+    var range = sheet.getRange(firstDataRow, deadlineCol, Math.max(sheet.getMaxRows() - headerRow, 1), 1);
+    var topLeftA1 = range.getCell(1, 1).getA1Notation();
+
+    // Drop any prior rule on this exact range first, so re-running this doesn't stack duplicates.
+    var rules = sheet.getConditionalFormatRules().filter(function(rule) {
+      var ranges = rule.getRanges();
+      return !(ranges.length === 1 && ranges[0].getA1Notation() === range.getA1Notation());
+    });
+
+    rules.push(
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenFormulaSatisfied("=AND(ISDATE(" + topLeftA1 + ")," + topLeftA1 + "<TODAY())")
+        .setBackground("#f4c7c3")
+        .setRanges([range])
+        .build()
+    );
+    sheet.setConditionalFormatRules(rules);
+  });
+
+  if (problems.length > 0) {
+    SpreadsheetApp.getUi().alert(
+      "Overdue-deadline highlighting couldn't be fully set up:\n" +
+      problems.map(function(p) { return "• " + p; }).join("\n") +
+      "\n\nFix this, then run the timezone/trigger setup again."
+    );
+  }
+}
+
+/** ====================== TIMEZONE-AWARE TRIGGER SETUP ====================== */
+
+function openTimezoneSyncDialog() {
+  var html = HtmlService.createHtmlOutputFromFile('TimezoneSync')
+      .setWidth(440)
+      .setHeight(340);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Set Up Recurring Task Schedule');
+}
+
+// Called from TimezoneSync.html once the user confirms (or corrects) their timezone
+function finalizeTriggerSetup(timeZone) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(RECURRING_SHEET);
+
+  if (!sheet) {
+    return { success: false, message: "Couldn't find a tab named \"Recurring\"." };
+  }
+
+  var cols = getColumnMap(sheet, OTHER_SHEETS_HEADER_ROW);
+  if (!requireColumns(cols, [COL_TRIGGER_ENABLED, COL_TRIGGER_DAY, COL_TRIGGER_HOUR], RECURRING_SHEET, OTHER_SHEETS_HEADER_ROW)) {
+    return { success: false, message: "Couldn't find the trigger table headers (\"Add Trigger\", \"Day of Week\", \"Time\") on Recurring." };
+  }
+
+  var enabledCol = getCol(cols, COL_TRIGGER_ENABLED);
+  var dayCol = getCol(cols, COL_TRIGGER_DAY);
+  var hourCol = getCol(cols, COL_TRIGGER_HOUR);
+
+  PropertiesService.getDocumentProperties().setProperty(TIMEZONE_PROPERTY_KEY, timeZone);
+  ss.setSpreadsheetTimeZone(timeZone);
+  // Same column as "Add Trigger", just a couple rows below the 7-day block - follows the table
+  // wherever it's positioned instead of a fixed cell that'd go stale if things got moved around.
+  var timezoneDisplayRow = OTHER_SHEETS_HEADER_ROW + 1 + TRIGGER_TABLE_ROWS + 2;
+  // Clear out any old "Detected Timezone" line before writing a new one, so re-running this
+  // never leaves a stray duplicate sitting nearby.
+  var cleanupRange = sheet.getRange(OTHER_SHEETS_HEADER_ROW + 1, enabledCol, TRIGGER_TABLE_ROWS + 10, 1);
+  var cleanupValues = cleanupRange.getValues();
+  var cleanupChanged = false;
+  for (var c = 0; c < cleanupValues.length; c++) {
+    if (String(cleanupValues[c][0]).indexOf("Detected Timezone:") === 0) {
+      cleanupValues[c][0] = "";
+      cleanupChanged = true;
+    }
+  }
+  if (cleanupChanged) cleanupRange.setValues(cleanupValues);
+  sheet.getRange(timezoneDisplayRow, enabledCol).setValue("Detected Timezone: " + timeZone);
+  var startCol = Math.min(enabledCol, dayCol, hourCol);
+  var endCol = Math.max(enabledCol, dayCol, hourCol);
+  var data = sheet.getRange(OTHER_SHEETS_HEADER_ROW + 1, startCol, TRIGGER_TABLE_ROWS, endCol - startCol + 1).getValues();
+
+  var hasError = false;
+  var anyChecked = false;
+
+  var processedData = data.map(function(rowData) {
+    var isEnabled = rowData[enabledCol - startCol];
+    var dayStr = rowData[dayCol - startCol];
+    var rawHour = rowData[hourCol - startCol];
+    var hourValue = null;
+
+    if (isEnabled === true) {
+      anyChecked = true;
+      if (rawHour instanceof Date) {
+        hourValue = rawHour.getHours();
+      } else if (!isNaN(rawHour) && rawHour !== "") {
+        hourValue = parseInt(rawHour);
+      }
+      if (hourValue === null || hourValue < 0 || hourValue > 23) {
+        hasError = true;
+      }
+    }
+    return { enabled: isEnabled, day: dayStr, hour: hourValue };
+  });
+
+  if (!anyChecked || hasError) {
+    return {
+      success: false,
+      message: "Please check the box for each day you want Daily-type tasks added, " +
+        "and set an hour (0-23) for each checked day."
+    };
+  }
+
+  var allTriggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < allTriggers.length; i++) {
+    if (allTriggers[i].getHandlerFunction() === "copyRecurringTasks") {
+      ScriptApp.deleteTrigger(allTriggers[i]);
+    }
+  }
+
+  // One trigger per checked day, just for Daily tasks - lets those follow a work schedule
+  // instead of firing literally every day.
+  var createdCount = 0;
+  var firstHour = null;
+  processedData.forEach(function(item) {
+    if (item.enabled === true) {
+      // Google's WeekDay enum keys are fixed English constants and can't be localized, but this
+      // is still forgiving of case and stray whitespace ("monday", " Monday " both work).
+      var dayEnum = ScriptApp.WeekDay[normalizeHeader(item.day).toUpperCase()];
+      if (dayEnum) {
+        ScriptApp.newTrigger("copyRecurringTasks")
+          .timeBased()
+          .onWeekDay(dayEnum)
+          .atHour(item.hour)
+          .inTimezone(timeZone)
+          .create();
+        createdCount++;
+        if (firstHour === null) firstHour = item.hour;
+      }
+    }
+  });
+
+  // One trigger that runs every single day, for Week/Month/Quarter/Year rules - guarantees these
+  // are always checked on their exact target day, independent of which days are checked above.
+  ScriptApp.newTrigger("copyRecurringTasks")
+    .timeBased()
+    .everyDays(1)
+    .atHour(firstHour !== null ? firstHour : 2)
+    .inTimezone(timeZone)
+    .create();
+
+  setUpOverdueDeadlineFormatting();
+
+  return {
+    success: true,
+    message: "Success! Automated schedule updated.\nTimezone: " + timeZone + "\nDaily-task days: " + createdCount
+  };
+}
+
+// Timezone to use for background trigger runs, when there's no browser to detect from.
+// Falls back to the spreadsheet's own timezone setting if the sync dialog has never been run.
+function getUserTimeZone() {
+  var stored = PropertiesService.getDocumentProperties().getProperty(TIMEZONE_PROPERTY_KEY);
+  if (stored) return stored;
+  return SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+}
