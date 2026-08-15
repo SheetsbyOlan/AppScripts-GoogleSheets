@@ -1,0 +1,175 @@
+<style>
+  body {
+    font-family: Arial, sans-serif;
+    padding: 16px;
+    color: #202124;
+  }
+  h3 {
+    margin-top: 0;
+    font-size: 16px;
+  }
+  .detected {
+    background: #f1f3f4;
+    border-radius: 6px;
+    padding: 12px;
+    margin: 12px 0;
+    font-size: 14px;
+  }
+  .detected strong {
+    display: block;
+    font-size: 15px;
+    margin-top: 4px;
+  }
+  select {
+    width: 100%;
+    padding: 8px;
+    font-size: 14px;
+    margin: 10px 0;
+  }
+  button {
+    padding: 8px 16px;
+    font-size: 13px;
+    border-radius: 4px;
+    border: none;
+    cursor: pointer;
+    margin-right: 8px;
+  }
+  .primary {
+    background: #1a73e8;
+    color: white;
+  }
+  .secondary {
+    background: none;
+    color: #1a73e8;
+    text-decoration: underline;
+  }
+  .hidden {
+    display: none;
+  }
+  .result {
+    white-space: pre-line;
+    font-size: 14px;
+    margin-top: 12px;
+  }
+  .result.error {
+    color: #c5221f;
+  }
+  .result.success {
+    color: #188038;
+  }
+</style>
+
+<div id="step-detect">
+  <h3>Confirm your timezone</h3>
+  <p>We use this to make sure recurring tasks are added at the right local time.</p>
+  <div class="detected">
+    Detected timezone:
+    <strong id="detected-label">Detecting...</strong>
+  </div>
+  <button class="primary" id="btn-confirm">Yes, that's correct</button>
+  <button class="secondary" id="btn-wrong">That's not right</button>
+</div>
+
+<div id="step-correct" class="hidden">
+  <h3>Pick your timezone</h3>
+  <select id="tz-select"></select>
+  <div>
+    <button class="primary" id="btn-confirm-correction">Use this timezone</button>
+    <button class="secondary" id="btn-back">Back</button>
+  </div>
+</div>
+
+<div id="step-result" class="hidden">
+  <div id="result-message" class="result"></div>
+  <button class="primary" id="btn-close">Close</button>
+</div>
+
+<script>
+  var TIMEZONES = {
+    "Eastern Time (US & Canada)": "America/New_York",
+    "Central Time (US & Canada)": "America/Chicago",
+    "Mountain Time (US & Canada)": "America/Denver",
+    "Arizona (no daylight saving)": "America/Phoenix",
+    "Pacific Time (US & Canada)": "America/Los_Angeles",
+    "Alaska": "America/Anchorage",
+    "Hawaii": "Pacific/Honolulu",
+    "Atlantic Time (Canada)": "America/Halifax",
+    "United Kingdom / Ireland": "Europe/London",
+    "Central Europe (Paris, Berlin, Madrid, Rome)": "Europe/Paris",
+    "Eastern Europe (Athens, Helsinki)": "Europe/Athens",
+    "Moscow": "Europe/Moscow",
+    "India": "Asia/Kolkata",
+    "China": "Asia/Shanghai",
+    "Japan": "Asia/Tokyo",
+    "Singapore": "Asia/Singapore",
+    "United Arab Emirates": "Asia/Dubai",
+    "Eastern Australia (Sydney, Melbourne)": "Australia/Sydney",
+    "Central Australia (Adelaide)": "Australia/Adelaide",
+    "Western Australia (Perth)": "Australia/Perth",
+    "New Zealand": "Pacific/Auckland",
+    "Brazil (Sao Paulo)": "America/Sao_Paulo",
+    "Argentina": "America/Argentina/Buenos_Aires",
+    "South Africa": "Africa/Johannesburg"
+  };
+
+  var detectedIana = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+  function friendlyNameFor(iana) {
+    for (var name in TIMEZONES) {
+      if (TIMEZONES[name] === iana) return name + " (" + iana + ")";
+    }
+    return iana;
+  }
+
+  document.getElementById('detected-label').textContent = friendlyNameFor(detectedIana);
+
+  var select = document.getElementById('tz-select');
+  Object.keys(TIMEZONES).sort().forEach(function(name) {
+    var opt = document.createElement('option');
+    opt.value = TIMEZONES[name];
+    opt.textContent = name;
+    select.appendChild(opt);
+  });
+
+  function showStep(id) {
+    ['step-detect', 'step-correct', 'step-result'].forEach(function(stepId) {
+      document.getElementById(stepId).classList.toggle('hidden', stepId !== id);
+    });
+  }
+
+  function submitTimezone(tz) {
+    document.querySelectorAll('button').forEach(function(b) { b.disabled = true; });
+    google.script.run
+      .withSuccessHandler(function(result) {
+        var el = document.getElementById('result-message');
+        el.textContent = result.message;
+        el.className = 'result ' + (result.success ? 'success' : 'error');
+        showStep('step-result');
+        document.querySelectorAll('button').forEach(function(b) { b.disabled = false; });
+      })
+      .withFailureHandler(function(err) {
+        var el = document.getElementById('result-message');
+        el.textContent = 'Something went wrong: ' + err.message;
+        el.className = 'result error';
+        showStep('step-result');
+        document.querySelectorAll('button').forEach(function(b) { b.disabled = false; });
+      })
+      .finalizeTriggerSetup(tz);
+  }
+
+  document.getElementById('btn-confirm').addEventListener('click', function() {
+    submitTimezone(detectedIana);
+  });
+  document.getElementById('btn-wrong').addEventListener('click', function() {
+    showStep('step-correct');
+  });
+  document.getElementById('btn-back').addEventListener('click', function() {
+    showStep('step-detect');
+  });
+  document.getElementById('btn-confirm-correction').addEventListener('click', function() {
+    submitTimezone(select.value);
+  });
+  document.getElementById('btn-close').addEventListener('click', function() {
+    google.script.host.close();
+  });
+</script>
