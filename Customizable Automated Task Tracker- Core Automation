@@ -538,22 +538,29 @@ function advanceYearBounds(bounds) {
   return getYearBounds(new Date(bounds.end.getFullYear() + 1, 0, 1));
 }
 
-function dateOnly(d) {
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+// Reduces a moment in time down to just its calendar date, read in a specific time zone -
+// deliberately NOT Session.getScriptTimeZone() (the time zone baked into this Apps Script
+// project's manifest, frozen at whatever it was when the project was created). That frozen
+// value has no connection to what a customer actually picks during setup, so using their chosen
+// time zone here is what makes "today" and "day of the week" come out right no matter where in
+// the world they are.
+function dateOnly(d, timeZone) {
+  var parts = Utilities.formatDate(d, timeZone, "yyyy-MM-dd").split("-");
+  return new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
 }
-function todayDateOnly() {
-  return dateOnly(new Date());
+function todayDateOnly(timeZone) {
+  return dateOnly(new Date(), timeZone);
 }
 
 // The earliest date a NEXT occurrence search should consider: the day after Last Added, or
 // today if this rule has never fired yet.
-function computeFloorDate(lastAdded) {
+function computeFloorDate(lastAdded, timeZone) {
   if (lastAdded instanceof Date) {
-    var floor = dateOnly(lastAdded);
+    var floor = dateOnly(lastAdded, timeZone);
     floor.setDate(floor.getDate() + 1);
     return floor;
   }
-  return todayDateOnly();
+  return todayDateOnly(timeZone);
 }
 
 /** ====================== LIVE NEXT ADD (Recurring sheet onEdit) ====================== */
@@ -581,14 +588,15 @@ function updateNextAddForEditedRows(sheet, range) {
 
   var startRow = range.getRow();
   var numRows = range.getNumRows();
+  var timeZone = getUserTimeZone();
   for (var i = 0; i < numRows; i++) {
     var row = startRow + i;
     if (row <= OTHER_SHEETS_HEADER_ROW) continue; // never touch the header row
-    refreshNextAddForRow(sheet, row, positionCol, dayCol, periodCol, lastAddedCol, nextAddCol);
+    refreshNextAddForRow(sheet, row, positionCol, dayCol, periodCol, lastAddedCol, nextAddCol, timeZone);
   }
 }
 
-function refreshNextAddForRow(sheet, row, positionCol, dayCol, periodCol, lastAddedCol, nextAddCol) {
+function refreshNextAddForRow(sheet, row, positionCol, dayCol, periodCol, lastAddedCol, nextAddCol, timeZone) {
   var period = sheet.getRange(row, periodCol).getValue();
   if (!period) { sheet.getRange(row, nextAddCol).setValue(""); return; }
 
@@ -606,7 +614,7 @@ function refreshNextAddForRow(sheet, row, positionCol, dayCol, periodCol, lastAd
   if ((needsPosition && !position) || !day) { sheet.getRange(row, nextAddCol).setValue(""); return; }
 
   var lastAdded = lastAddedCol ? sheet.getRange(row, lastAddedCol).getValue() : "";
-  var nextDate = computeNextOccurrence(position, day, period, computeFloorDate(lastAdded));
+  var nextDate = computeNextOccurrence(position, day, period, computeFloorDate(lastAdded, timeZone));
   sheet.getRange(row, nextAddCol).setValue(nextDate || "");
 }
 
@@ -624,10 +632,15 @@ function copyRecurringTasks() {
   if (!requireColumns(recCols, recRequired, RECURRING_SHEET, OTHER_SHEETS_HEADER_ROW)) return;
   if (!requireColumns(taskListCols, [COL_TASK_ADDED, COL_DEADLINE], TASK_LIST_SHEET, TASK_LIST_HEADER_ROW)) return;
 
+  // Every "what day is it" calculation below uses this - the time zone the customer actually
+  // picked during setup, never Session.getScriptTimeZone() (this project's own frozen manifest
+  // setting), which won't match a customer outside of wherever this template was originally built.
+  var timeZone = getUserTimeZone();
+
   // Global pause - nothing fires, for any rule, while today is before the Resume Date.
   var resumeDateValue = recurringSheet.getRange(RESUME_DATE_CELL).getValue();
-  var today = todayDateOnly();
-  if (resumeDateValue instanceof Date && dateOnly(resumeDateValue) > today) {
+  var today = todayDateOnly(timeZone);
+  if (resumeDateValue instanceof Date && dateOnly(resumeDateValue, timeZone) > today) {
     ss.toast(
       "Recurring tasks are paused until " + Utilities.formatDate(resumeDateValue, ss.getSpreadsheetTimeZone(), "MM/dd/yyyy") + ".",
       "Recurring Tasks", 4
@@ -660,7 +673,7 @@ function copyRecurringTasks() {
   var nextAddCol = getCol(recCols, COL_REC_NEXT_ADD);
   var daysToCompleteCol = getCol(recCols, COL_DAYS_TO_COMPLETE); // optional field
 
-  var todayIsDailyTriggerDay = isTodayACheckedTriggerDay(recurringSheet, recCols);
+  var todayIsDailyTriggerDay = isTodayACheckedTriggerDay(recurringSheet, recCols, timeZone);
 
   var newTaskRows = [];   // { fields: [...], deadline: Date|null }
   var recUpdates = [];    // { row, lastAdded: Date, nextAdd: Date|string }
@@ -676,7 +689,7 @@ function copyRecurringTasks() {
     var position, day;
 
     if (canonicalPeriod(period) === PERIOD_DAY) {
-      var lastAddedIsToday = lastAdded instanceof Date && dateOnly(lastAdded).getTime() === today.getTime();
+      var lastAddedIsToday = lastAdded instanceof Date && dateOnly(lastAdded, timeZone).getTime() === today.getTime();
       due = todayIsDailyTriggerDay && !lastAddedIsToday;
       targetDate = today;
     } else {
@@ -685,7 +698,7 @@ function copyRecurringTasks() {
       var needsPosition = canonicalPeriod(period) !== PERIOD_WEEK && parseDayOfMonth(day) === null;
       if ((needsPosition && !position) || !day) continue; // unconfigured row
 
-      var nextOccurrence = computeNextOccurrence(position, day, period, computeFloorDate(lastAdded));
+      var nextOccurrence = computeNextOccurrence(position, day, period, computeFloorDate(lastAdded, timeZone));
       if (!nextOccurrence) continue;
       due = nextOccurrence <= today;
       targetDate = nextOccurrence;
@@ -716,7 +729,7 @@ function copyRecurringTasks() {
 
     var newNextAdd = canonicalPeriod(period) === PERIOD_DAY
       ? "Daily (per trigger schedule)"
-      : (computeNextOccurrence(position, day, period, computeFloorDate(today)) || "");
+      : (computeNextOccurrence(position, day, period, computeFloorDate(today, timeZone)) || "");
     recUpdates.push({ row: row, lastAdded: today, nextAdd: newNextAdd });
   }
 
@@ -725,7 +738,6 @@ function copyRecurringTasks() {
     return;
   }
 
-  var timeZone = getUserTimeZone();
   var nowFormatted = Utilities.formatDate(new Date(), timeZone, "yyyy-MM-dd HH:mm:ss");
   var nextRow = taskListSheet.getLastRow() + 1;
   var taskAddedCol = getCol(taskListCols, COL_TASK_ADDED);
@@ -763,12 +775,14 @@ function copyRecurringTasks() {
 
 // Checks whether today is one of the checked days in the trigger table. This is what gates
 // Daily tasks specifically.
-function isTodayACheckedTriggerDay(recurringSheet, recCols) {
+function isTodayACheckedTriggerDay(recurringSheet, recCols, timeZone) {
   var enabledCol = getCol(recCols, COL_TRIGGER_ENABLED);
   var dayCol = getCol(recCols, COL_TRIGGER_DAY);
   if (!enabledCol || !dayCol) return false;
 
-  var todayName = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][new Date().getDay()];
+  // "EEEE" spells out the English weekday name regardless of locale, read in the customer's
+  // chosen time zone - not Session.getScriptTimeZone(), for the same reason as dateOnly() above.
+  var todayName = Utilities.formatDate(new Date(), timeZone, "EEEE");
   var startCol = Math.min(enabledCol, dayCol);
   var endCol = Math.max(enabledCol, dayCol);
   var data = recurringSheet.getRange(OTHER_SHEETS_HEADER_ROW + 1, startCol, TRIGGER_TABLE_ROWS, endCol - startCol + 1).getValues();
@@ -919,8 +933,8 @@ function addTaskBundle(projectName) {
   }
 
   var daysToCompleteCol = getCol(bundleCols, COL_DAYS_TO_COMPLETE); // optional field, same as Recurring
-  var today = todayDateOnly();
   var timeZone = getUserTimeZone();
+  var today = todayDateOnly(timeZone);
   var nowFormatted = Utilities.formatDate(new Date(), timeZone, "yyyy-MM-dd HH:mm:ss");
   var taskAddedCol = getCol(taskListCols, COL_TASK_ADDED);
   var deadlineColOnTaskList = getCol(taskListCols, COL_DEADLINE);
