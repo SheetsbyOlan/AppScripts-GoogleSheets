@@ -440,10 +440,17 @@ function computeNextOccurrence(position, dayName, period, notBefore) {
     }
   }
 
-  var dayIndex = DAY_NAME_TO_INDEX[normalizeHeader(dayName)];
-  if (dayIndex === undefined) return null;
+  // "Weekday" means any Monday-Friday, not one specific day - needs Position (First/Last/etc.)
+  // to mean anything, so it only makes sense paired with Month/Quarter/Year, same as a named
+  // weekday does below. Covers things like "last weekday of the quarter" for a month/quarter-end
+  // rule that shouldn't land on a weekend.
+  var isWeekday = normalizeHeader(dayName) === "weekday";
+
+  var dayIndex = isWeekday ? null : DAY_NAME_TO_INDEX[normalizeHeader(dayName)];
+  if (!isWeekday && dayIndex === undefined) return null;
 
   if (period_ === PERIOD_WEEK) {
+    if (isWeekday) return null; // no Position to anchor to within a single week
     return nextWeekdayOnOrAfter(notBefore, dayIndex);
   }
 
@@ -455,7 +462,9 @@ function computeNextOccurrence(position, dayName, period, notBefore) {
 
   var bounds = boundsFn(notBefore);
   for (var i = 0; i < 5; i++) { // safety bound - real answer always resolves within 1-2 iterations
-    var candidate = nthWeekdayInRange(bounds.start, bounds.end, position, dayIndex);
+    var candidate = isWeekday
+      ? nthBusinessDayInRange(bounds.start, bounds.end, position)
+      : nthWeekdayInRange(bounds.start, bounds.end, position, dayIndex);
     if (candidate && candidate >= notBefore) return candidate;
     bounds = advanceFn(bounds);
   }
@@ -494,6 +503,18 @@ function nextWeekdayOnOrAfter(notBefore, dayIndex) {
   return d;
 }
 
+// Shared by nthWeekdayInRange and nthBusinessDayInRange below - picks First/Second/Third/Fourth/
+// Last out of an already-in-order list of candidate dates.
+function pickByPosition(occurrences, position) {
+  if (occurrences.length === 0) return null;
+  var normalizedPosition = normalizeHeader(position);
+  if (LAST_POSITION_NAMES.indexOf(normalizedPosition) !== -1) {
+    return occurrences[occurrences.length - 1];
+  }
+  var positionNum = POSITION_NUMBERS[normalizedPosition];
+  return positionNum ? (occurrences[positionNum - 1] || null) : null;
+}
+
 // Every occurrence of dayIndex within [start, end], then picks the requested position from that list.
 function nthWeekdayInRange(start, end, position, dayIndex) {
   var occurrences = [];
@@ -504,13 +525,21 @@ function nthWeekdayInRange(start, end, position, dayIndex) {
     occurrences.push(new Date(d));
     d.setDate(d.getDate() + 7);
   }
-  if (occurrences.length === 0) return null;
-  var normalizedPosition = normalizeHeader(position);
-  if (LAST_POSITION_NAMES.indexOf(normalizedPosition) !== -1) {
-    return occurrences[occurrences.length - 1];
+  return pickByPosition(occurrences, position);
+}
+
+// Same idea as nthWeekdayInRange, but for the "Weekday" Day value - every Monday-Friday within
+// [start, end] instead of one specific day name, so "Last" finds the last business day of the
+// month/quarter/year no matter which actual day of the week that lands on.
+function nthBusinessDayInRange(start, end, position) {
+  var occurrences = [];
+  var d = new Date(start);
+  while (d <= end) {
+    var dayOfWeek = d.getDay();
+    if (dayOfWeek !== 0 && dayOfWeek !== 6) occurrences.push(new Date(d)); // skip Sun/Sat
+    d.setDate(d.getDate() + 1);
   }
-  var positionNum = POSITION_NUMBERS[normalizedPosition];
-  return positionNum ? (occurrences[positionNum - 1] || null) : null;
+  return pickByPosition(occurrences, position);
 }
 
 function getMonthBounds(refDate) {
