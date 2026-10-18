@@ -94,6 +94,12 @@ const PERIOD_MONTH = "Month";
 const PERIOD_QUARTER = "Quarter";
 const PERIOD_YEAR = "Year";
 
+// Position "Every" (below) + a number in Day turns ANY period into a repeat interval instead of
+// a calendar pattern - "Every 3" + Week = every 3 weeks, "Every 6" + Month = every 6 months,
+// "Every 28" + Day = every 28 days. One mechanism covers all of these instead of a separate
+// period value per interval.
+const POSITION_EVERY = "every";
+
 /** ====================== DROPDOWN VOCABULARY ======================
  *  Position/Day/Period values are matched here. Case and spacing don't matter -
  *  "monday", " Monday ", and "MONDAY" all work the same.
@@ -482,6 +488,16 @@ function parseDayOfMonth(dayName) {
   return null;
 }
 
+// The "N" for a Position = Every rule ("Every 3" Weeks, "Every 28" Days) - any positive whole
+// number, not capped at 31 like a day-of-month value, since this covers things like "every 60
+// days" or "every 90 days" too.
+function parseEveryInterval(dayValue) {
+  var normalized = normalizeHeader(dayValue);
+  var num = Number(normalized);
+  if (normalized !== "" && !isNaN(num) && Number.isInteger(num) && num >= 1) return num;
+  return null;
+}
+
 // Finds the next date on or after notBefore that falls on dayOfMonth, clamped to the real last
 // day of the month when it's too big (31 in February becomes the 28th/29th).
 function nextDayOfMonthOnOrAfter(notBefore, dayOfMonth) {
@@ -567,15 +583,18 @@ function advanceYearBounds(bounds) {
   return getYearBounds(new Date(bounds.end.getFullYear() + 1, 0, 1));
 }
 
-// Reduces a moment in time down to just its calendar date, read in a specific time zone -
+// Reduces a moment in time down to just its calendar date, anchored to a specific time zone -
 // deliberately NOT Session.getScriptTimeZone() (the time zone baked into this Apps Script
-// project's manifest, frozen at whatever it was when the project was created). That frozen
-// value has no connection to what a customer actually picks during setup, so using their chosen
-// time zone here is what makes "today" and "day of the week" come out right no matter where in
-// the world they are.
+// project's manifest, frozen at whatever it was when the project was created). Uses
+// Utilities.parseDate rather than the plain Date constructor for the rebuild step, not just
+// Utilities.formatDate for reading it - the plain constructor (new Date(y, m, d)) always anchors
+// its result to the script's own ambient time zone, so if that's read out through a DIFFERENT
+// time zone later (the spreadsheet's own setting, say), the displayed date/time silently shifts
+// by however many hours those two time zones differ by. Anchoring the rebuild to the SAME
+// timeZone as the read keeps the two symmetric no matter what the manifest happens to say.
 function dateOnly(d, timeZone) {
-  var parts = Utilities.formatDate(d, timeZone, "yyyy-MM-dd").split("-");
-  return new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+  var formatted = Utilities.formatDate(d, timeZone, "yyyy-MM-dd");
+  return Utilities.parseDate(formatted, timeZone, "yyyy-MM-dd");
 }
 function todayDateOnly(timeZone) {
   return dateOnly(new Date(), timeZone);
@@ -590,6 +609,28 @@ function computeFloorDate(lastAdded, timeZone) {
     return floor;
   }
   return todayDateOnly(timeZone);
+}
+
+// Adds N of whatever the period's natural unit is onto a date - N days, N*7 days for weeks,
+// N months, N*3 months for quarters, N years. Shared by every Position = Every rule regardless
+// of which period it's paired with.
+function addIntervalToDate(date, period_, n) {
+  var result = new Date(date);
+  if (period_ === PERIOD_DAY) result.setDate(result.getDate() + n);
+  else if (period_ === PERIOD_WEEK) result.setDate(result.getDate() + n * 7);
+  else if (period_ === PERIOD_MONTH) result.setMonth(result.getMonth() + n);
+  else if (period_ === PERIOD_QUARTER) result.setMonth(result.getMonth() + n * 3);
+  else if (period_ === PERIOD_YEAR) result.setFullYear(result.getFullYear() + n);
+  return result;
+}
+
+// A Position = Every rule has no calendar pattern to search for - it just fires again N periods
+// after it last fired (today + N days/weeks/months/quarters/years, whichever the Period column
+// says). First time ever (no Last Added yet), it fires right away, same as any other rule would
+// on its first run - there's nothing to count forward FROM yet.
+function nextEveryOccurrence(lastAdded, period_, n, timeZone) {
+  if (!(lastAdded instanceof Date)) return todayDateOnly(timeZone);
+  return addIntervalToDate(dateOnly(lastAdded, timeZone), period_, n);
 }
 
 /** ====================== LIVE NEXT ADD (Recurring sheet onEdit) ====================== */
@@ -629,17 +670,31 @@ function refreshNextAddForRow(sheet, row, positionCol, dayCol, periodCol, lastAd
   var period = sheet.getRange(row, periodCol).getValue();
   if (!period) { sheet.getRange(row, nextAddCol).setValue(""); return; }
 
-  if (canonicalPeriod(period) === PERIOD_DAY) {
+  var period_ = canonicalPeriod(period);
+  var position = sheet.getRange(row, positionCol).getValue();
+  var day = sheet.getRange(row, dayCol).getValue();
+  var everyN = normalizeHeader(position) === POSITION_EVERY ? parseEveryInterval(day) : null;
+
+  // Position = Every turns whichever period is selected into a flat repeat interval instead of
+  // a calendar pattern - but only when Day actually holds a valid interval number. If it
+  // doesn't (a leftover weekday name, say), Every isn't a logical fit here, so it's ignored and
+  // the row just falls through to the normal handling below for its period - same as any other
+  // Position value that doesn't apply (like "Third" on a Week rule) already gets ignored there.
+  if (everyN !== null && period_) {
+    var everyLastAdded = lastAddedCol ? sheet.getRange(row, lastAddedCol).getValue() : "";
+    sheet.getRange(row, nextAddCol).setValue(nextEveryOccurrence(everyLastAdded, period_, everyN, timeZone));
+    return;
+  }
+
+  if (period_ === PERIOD_DAY) {
     sheet.getRange(row, nextAddCol).setValue("Daily (per trigger schedule)");
     return;
   }
 
-  var position = sheet.getRange(row, positionCol).getValue();
-  var day = sheet.getRange(row, dayCol).getValue();
   // Position only matters for a weekday-based Month/Quarter/Year rule. A week only has one of
   // each weekday, so Week rules just need Day. A plain day-of-month value like "5" or "Last"
   // only has one possible date too, so Position doesn't matter there either.
-  var needsPosition = canonicalPeriod(period) !== PERIOD_WEEK && parseDayOfMonth(day) === null;
+  var needsPosition = period_ !== PERIOD_WEEK && parseDayOfMonth(day) === null;
   if ((needsPosition && !position) || !day) { sheet.getRange(row, nextAddCol).setValue(""); return; }
 
   var lastAdded = lastAddedCol ? sheet.getRange(row, lastAddedCol).getValue() : "";
@@ -649,7 +704,23 @@ function refreshNextAddForRow(sheet, row, positionCol, dayCol, periodCol, lastAd
 
 /** ====================== RECURRING TASKS ====================== */
 
+// The "every single day" trigger and a specific checked day's trigger can land on the same hour
+// (finalizeTriggerSetup deliberately schedules them together), so this can genuinely fire twice
+// at once from two different triggers. Without a lock, both runs read the sheet's "not added yet"
+// state before either one writes - causing duplicate rows, or in a worse timing case, both runs
+// stepping on each other's writes and leaving Last Added/Next Add in a corrupted state. The lock
+// makes the second overlapping run just exit immediately instead of racing the first.
 function copyRecurringTasks() {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(0)) return; // another run is already in progress - let it finish, don't race it
+  try {
+    copyRecurringTasksLocked();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function copyRecurringTasksLocked() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var recurringSheet = ss.getSheetByName(RECURRING_SHEET);
   var taskListSheet = ss.getSheetByName(TASK_LIST_SHEET);
@@ -715,16 +786,26 @@ function copyRecurringTasks() {
     var lastAdded = recurringSheet.getRange(row, lastAddedCol).getValue();
     var due = false;
     var targetDate = null; // the date this occurrence was actually due, used for the Deadline calc
-    var position, day;
+    var period_ = canonicalPeriod(period);
+    var position = recurringSheet.getRange(row, positionCol).getValue();
+    var day = recurringSheet.getRange(row, dayCol).getValue();
+    var everyN = normalizeHeader(position) === POSITION_EVERY ? parseEveryInterval(day) : null;
 
-    if (canonicalPeriod(period) === PERIOD_DAY) {
+    // Position = Every turns whichever period is selected into a flat repeat interval instead
+    // of a calendar pattern - but only when Day actually holds a valid interval number. If it
+    // doesn't, Every isn't a logical fit here, so it's ignored and this row falls through to
+    // the normal handling below for its period - same as an irrelevant Position (like "Third"
+    // on a Week rule) already gets ignored there.
+    if (everyN !== null && period_) {
+      var everyNextOccurrence = nextEveryOccurrence(lastAdded, period_, everyN, timeZone);
+      due = everyNextOccurrence <= today;
+      targetDate = everyNextOccurrence;
+    } else if (period_ === PERIOD_DAY) {
       var lastAddedIsToday = lastAdded instanceof Date && dateOnly(lastAdded, timeZone).getTime() === today.getTime();
       due = todayIsDailyTriggerDay && !lastAddedIsToday;
       targetDate = today;
     } else {
-      position = recurringSheet.getRange(row, positionCol).getValue();
-      day = recurringSheet.getRange(row, dayCol).getValue();
-      var needsPosition = canonicalPeriod(period) !== PERIOD_WEEK && parseDayOfMonth(day) === null;
+      var needsPosition = period_ !== PERIOD_WEEK && parseDayOfMonth(day) === null;
       if ((needsPosition && !position) || !day) continue; // unconfigured row
 
       var nextOccurrence = computeNextOccurrence(position, day, period, computeFloorDate(lastAdded, timeZone));
@@ -756,7 +837,9 @@ function copyRecurringTasks() {
 
     newTaskRows.push({ fields: fields, deadline: deadlineDate, sourceRow: row });
 
-    var newNextAdd = canonicalPeriod(period) === PERIOD_DAY
+    var newNextAdd = (everyN !== null && period_)
+      ? nextEveryOccurrence(today, period_, everyN, timeZone)
+      : period_ === PERIOD_DAY
       ? "Daily (per trigger schedule)"
       : (computeNextOccurrence(position, day, period, computeFloorDate(today, timeZone)) || "");
     recUpdates.push({ row: row, lastAdded: today, nextAdd: newNextAdd });
